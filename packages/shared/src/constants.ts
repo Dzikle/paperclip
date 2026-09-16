@@ -1407,6 +1407,10 @@ export const PLUGIN_CAPABILITIES = [
   "http.outbound",
   "secrets.read-ref",
   "environment.drivers.register",
+  // Participate in the host-controlled, pre-dispatch run-context enrichment
+  // stage. The hook receives only the run's already-governed MCP assignment
+  // and may return bounded prompt text plus an artifact descriptor.
+  "agent.run.enrich",
   "local.folders",
   // Agent Tools
   "agent.tools.register",

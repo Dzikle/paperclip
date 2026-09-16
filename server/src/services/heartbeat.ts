@@ -27,6 +27,7 @@ import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
+import { enrichRunContextBeforeDispatch } from "./run-context-enrichment.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
@@ -22654,6 +22655,7 @@ export function heartbeatService(
         });
         let nativeExecution: NativeExecutionInput | null = null;
         let nativeRunnerInstanceId: string | null = null;
+        let preDispatchRuntimeMcpServers: AdapterRuntimeMcpServer[] | null = null;
         if (nativeRuntimeResolution.kind === "native") {
           if (!issueRef) {
             throw new Error("native_runtime_ineligible: issue is required");
@@ -23038,6 +23040,27 @@ export function heartbeatService(
               runId: run.id,
               runtimeConfig,
               runtimeSkillEntries,
+            });
+            preDispatchRuntimeMcpServers = await buildPaperclipRuntimeMcpServers({
+              db,
+              agent,
+              runId: run.id,
+              expectedAssignmentDigest: nativeRuntimeContext.mcp.digest,
+            });
+            await enrichRunContextBeforeDispatch({
+              db,
+              workerManager: options.pluginWorkerManager,
+              run,
+              issueId: issueRef.id,
+              adapterType: agent.adapterType,
+              context,
+              workspace: {
+                cwd: executionWorkspace.cwd,
+                repoUrl: executionWorkspace.repoUrl,
+                repoRef: executionWorkspace.repoRef,
+                branchName: executionWorkspace.branchName,
+              },
+              runtimeMcpServers: preDispatchRuntimeMcpServers,
             });
             const nativeExecutionWithCheckpoint =
               buildNativeExecutionWithCheckpoint({
@@ -23599,21 +23622,23 @@ export function heartbeatService(
               nativeExecution.runtimeContext.mcp.bindingId
                 ? nativeExecution.runtimeContext.mcp.digest
                 : null;
-            const nativeMcpServers = await buildPaperclipRuntimeMcpServers({
-              db,
-              agent,
-              runId: run.id,
-              expectedAssignmentDigest: expectedNativeMcpDigest,
-              onUnavailableAssignedConnections: async (connections) => {
-                const names = connections
-                  .map((connection) => connection.name)
-                  .join(", ");
-                await onLog(
-                  "stderr",
-                  `[paperclip] App connection${connections.length === 1 ? "" : "s"} unavailable: ${names}. Continuing this run without ${connections.length === 1 ? "it" : "them"}; reconnect from Apps to restore access.\n`,
-                );
-              },
-            });
+            const nativeMcpServers =
+              preDispatchRuntimeMcpServers ??
+              (await buildPaperclipRuntimeMcpServers({
+                db,
+                agent,
+                runId: run.id,
+                expectedAssignmentDigest: expectedNativeMcpDigest,
+                onUnavailableAssignedConnections: async (connections) => {
+                  const names = connections
+                    .map((connection) => connection.name)
+                    .join(", ");
+                  await onLog(
+                    "stderr",
+                    `[paperclip] App connection${connections.length === 1 ? "" : "s"} unavailable: ${names}. Continuing this run without ${connections.length === 1 ? "it" : "them"}; reconnect from Apps to restore access.\n`,
+                  );
+                },
+              }));
             if ("runtimeContext" in nativeExecution) {
               if (nativeMcpServers.length > 1)
                 throw new Error(
@@ -23847,17 +23872,6 @@ export function heartbeatService(
             // adapters need it in their prompt, but the authoritative answers
             // remain on the interaction instead of being duplicated in the
             // heartbeat run snapshot.
-            const adapterContext: Record<string, unknown> = {
-              ...context,
-              ...(legacyQuestionResponse
-                ? {
-                    [PAPERCLIP_WAKE_PAYLOAD_KEY]: {
-                      ...parseObject(context[PAPERCLIP_WAKE_PAYLOAD_KEY]),
-                      questionResponse: legacyQuestionResponse,
-                    },
-                  }
-                : {}),
-            };
             const runtimeTools = createAdapterRuntimeToolAccess({
               agentId: agent.id,
               companyId: agent.companyId,
@@ -23879,6 +23893,32 @@ export function heartbeatService(
               agent,
               runId: run.id,
             });
+            await enrichRunContextBeforeDispatch({
+              db,
+              workerManager: options.pluginWorkerManager,
+              run,
+              issueId: issueRef?.id ?? null,
+              adapterType: agent.adapterType,
+              context,
+              workspace: {
+                cwd: executionWorkspace.cwd,
+                repoUrl: executionWorkspace.repoUrl,
+                repoRef: executionWorkspace.repoRef,
+                branchName: executionWorkspace.branchName,
+              },
+              runtimeMcpServers,
+            });
+            const adapterContext: Record<string, unknown> = {
+              ...context,
+              ...(legacyQuestionResponse
+                ? {
+                    [PAPERCLIP_WAKE_PAYLOAD_KEY]: {
+                      ...parseObject(context[PAPERCLIP_WAKE_PAYLOAD_KEY]),
+                      questionResponse: legacyQuestionResponse,
+                    },
+                  }
+                : {}),
+            };
             const runtimeToolDelivery =
               adapter.runtimeToolDelivery ?? "invocation_context";
             if (runtimeTools && runtimeToolDelivery === "native_mcp") {

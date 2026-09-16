@@ -530,6 +530,7 @@ Optional methods:
 - `getData(input)`
 - `performAction(input)`
 - `executeTool(input)`
+- `enrichRunContext(input)`
 
 ### 13.1 `initialize`
 
@@ -639,6 +640,19 @@ The host provides:
 - run context: agent ID, run ID, company ID, project ID
 
 The worker executes the tool and returns a typed result (string content, structured data, or error).
+
+### 13.11 `enrichRunContext`
+
+Runs after Paperclip has admitted and prepared a run, but before it invokes the selected adapter. This is a narrow enrichment stage, not a nested executor: Paperclip retains the run identity, selected adapter, permission checks, budget checks, and completion semantics.
+
+Only ready, company-enabled plugins that declare `agent.run.enrich` participate. The host invokes them in stable install order and provides:
+
+- company, run, agent, issue, and selected-adapter identity;
+- a read-only task-context snapshot;
+- the resolved execution workspace;
+- only the run-scoped MCP servers already authorized for the selected agent.
+
+Each plugin returns bounded prompt Markdown, a content-addressed artifact descriptor (`ref`, `sha256`, optional media type and byte size), and bounded metadata. The host validates and persists the result on the same run before adapter dispatch. A persisted result is the idempotency marker during same-run restart recovery; the hook is not invoked again. A declared enricher that is unavailable or returns invalid/unbounded data fails the run closed.
 
 ## 14. SDK Surface
 
@@ -859,6 +873,7 @@ The host enforces capabilities in the SDK layer and refuses calls outside the gr
 - `http.outbound`
 - `secrets.read-ref`
 - `environment.drivers.register`
+- `agent.run.enrich`
 
 ### Agent Tools
 
