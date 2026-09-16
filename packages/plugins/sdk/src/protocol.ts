@@ -465,6 +465,46 @@ export interface ExecuteToolParams {
   runContext: ToolRunContext;
 }
 
+/** Ephemeral MCP access for this enricher, authorized for the selected agent and revoked after the hook returns. */
+export interface RunContextEnrichmentMcpServer {
+  name: string;
+  url: string;
+  token: string;
+  connectionId: string;
+}
+
+/** Host-owned input for the optional pre-dispatch run-context enrichment hook. */
+export interface RunContextEnrichmentParams {
+  companyId: string;
+  runId: string;
+  agentId: string;
+  issueId: string | null;
+  adapterType: string;
+  taskContext: Readonly<Record<string, unknown>>;
+  workspace: {
+    cwd: string;
+    repoUrl?: string | null;
+    repoRef?: string | null;
+    branchName?: string | null;
+  };
+  runtimeMcpServers: RunContextEnrichmentMcpServer[];
+}
+
+/** Durable, content-addressed context artifact produced by an enricher. */
+export interface RunContextEnrichmentArtifact {
+  ref: string;
+  sha256: string;
+  mediaType?: string | null;
+  byteSize?: number | null;
+}
+
+/** Bounded enrichment returned before Paperclip invokes the selected adapter. */
+export interface RunContextEnrichmentResult {
+  promptMarkdown?: string | null;
+  artifact: RunContextEnrichmentArtifact;
+  metadata?: Record<string, unknown> | null;
+}
+
 export interface PluginExternalObjectUrlCandidate {
   sanitizedCanonicalUrl: string;
   sanitizedDisplayUrl: string;
@@ -1343,6 +1383,11 @@ export interface HostToWorkerMethods {
   performAction: [params: PerformActionParams, result: unknown];
   /** @see PLUGIN_SPEC.md §13.10 */
   executeTool: [params: ExecuteToolParams, result: ToolResult];
+  /** Optional pre-dispatch, capability-gated run-context enrichment. */
+  enrichRunContext: [
+    params: RunContextEnrichmentParams,
+    result: RunContextEnrichmentResult,
+  ];
   detectExternalObjects: [
     params: DetectExternalObjectsParams,
     result: DetectExternalObjectsResult,
@@ -1470,6 +1515,7 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[] 
   "getData",
   "performAction",
   "executeTool",
+  "enrichRunContext",
   "detectExternalObjects",
   "resolveExternalObject",
   "refreshExternalObjects",

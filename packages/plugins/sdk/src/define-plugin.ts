@@ -97,6 +97,8 @@ import type {
   PluginDuplexChannelStopParams,
   PluginDuplexChannelCloseParams,
   PluginDuplexChannelCloseResult,
+  RunContextEnrichmentParams,
+  RunContextEnrichmentResult,
 } from "./protocol.js";
 
 // ---------------------------------------------------------------------------
@@ -235,6 +237,16 @@ export interface PluginDefinition {
    * @param ctx - The full plugin context provided by the host
    */
   setup(ctx: PluginContext): Promise<void>;
+
+  /**
+   * Optionally enrich an admitted run before Paperclip invokes its selected
+   * adapter. The host persists the returned artifact descriptor and bounded
+   * prompt text on the same run before dispatch. Requires
+   * `agent.run.enrich` in the plugin manifest.
+   */
+  onRunContextEnrich?(
+    params: RunContextEnrichmentParams,
+  ): Promise<RunContextEnrichmentResult>;
 
   /**
    * Called when the host wants to know if the plugin is healthy.

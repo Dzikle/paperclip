@@ -24,7 +24,12 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { buildPaperclipRuntimeMcpServers, createManagedMcpRunConfig } from "../services/heartbeat.js";
+import {
+  buildPaperclipNativeRuntimeMcpServers,
+  buildPaperclipRuntimeMcpServers,
+  createManagedMcpRunConfig,
+  revokeHeartbeatRunGatewayTokens,
+} from "../services/heartbeat.js";
 
 import { toolAccessService } from "../services/tool-access.js";
 
@@ -135,8 +140,20 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
     });
 
     const before = Date.now();
-    const first = await buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId: randomUUID() });
-    const second = await buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId: randomUUID() });
+    const enrichmentRunId = randomUUID();
+    const otherRunId = randomUUID();
+    const first = await buildPaperclipRuntimeMcpServers({
+      db,
+      agent: agent!,
+      runId: enrichmentRunId,
+      runtimeToken: {
+        name: "Enricher fixture",
+        clientLabel: "Test enrichment",
+        ownerNote: "Test short-lived credential.",
+        expiresAt: new Date(before + 5 * 60 * 1_000),
+      },
+    });
+    const second = await buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId: otherRunId });
 
     expect(first).toHaveLength(1);
     expect(first[0]).toMatchObject({
@@ -160,10 +177,22 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
     for (const token of tokens) {
       expect(token.subjectType).toBe("heartbeat_run");
       expect(token.subjectId).toMatch(/^[0-9a-f-]{36}$/);
-      expect(token.expiresAt!.getTime()).toBeGreaterThanOrEqual(before + 59 * 60 * 1000);
-      expect(token.expiresAt!.getTime()).toBeLessThanOrEqual(Date.now() + 61 * 60 * 1000);
+      const expectedExpiry = token.subjectId === enrichmentRunId
+        ? before + 5 * 60 * 1_000
+        : before + 60 * 60 * 1_000;
+      expect(token.expiresAt!.getTime()).toBeGreaterThanOrEqual(expectedExpiry);
+      expect(token.expiresAt!.getTime()).toBeLessThanOrEqual(expectedExpiry + 60_000);
     }
     expect(JSON.stringify(tokens)).not.toContain(first[0]!.token);
+
+    await revokeHeartbeatRunGatewayTokens({ db, companyId: company!.id, runId: enrichmentRunId });
+    const afterRelease = await db.select().from(toolMcpGatewayTokens);
+    expect(afterRelease.find((token) => token.subjectId === enrichmentRunId)?.revokedAt).not.toBeNull();
+    expect(afterRelease.find((token) => token.subjectId === otherRunId)?.revokedAt).toBeNull();
+    const native = await buildPaperclipRuntimeMcpServers({ db, agent: agent!, runId: enrichmentRunId });
+    expect(native[0]!.token).not.toBe(first[0]!.token);
+    const afterNative = await db.select().from(toolMcpGatewayTokens);
+    expect(afterNative.filter((token) => token.subjectId === enrichmentRunId && token.revokedAt === null)).toHaveLength(1);
 
     await expect(
       buildPaperclipRuntimeMcpServers({
@@ -173,7 +202,7 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
         expectedAssignmentDigest: "0".repeat(64),
       }),
     ).resolves.toEqual([]);
-    expect(await db.select().from(toolMcpGatewayTokens)).toHaveLength(2);
+    expect(await db.select().from(toolMcpGatewayTokens)).toHaveLength(3);
 
     await db.update(toolConnections)
       .set({ healthStatus: "degraded", healthMessage: "fixture unavailable" })
@@ -193,7 +222,25 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
     expect(unavailableReports).toEqual([[
       { id: installedConnection!.id, name: installedConnection!.name },
     ]]);
-    expect(await db.select().from(toolMcpGatewayTokens)).toHaveLength(2);
+    expect(await db.select().from(toolMcpGatewayTokens)).toHaveLength(3);
+
+    const nativeLogs: Array<{ stream: string; text: string }> = [];
+    await expect(
+      buildPaperclipNativeRuntimeMcpServers({
+        db,
+        agent: agent!,
+        runId: randomUUID(),
+        expectedAssignmentDigest: first[0]!.connectionId.slice("assignment:".length),
+        onLog: async (stream, text) => {
+          nativeLogs.push({ stream, text });
+        },
+      }),
+    ).resolves.toEqual([]);
+    expect(nativeLogs).toEqual([{
+      stream: "stderr",
+      text: "[paperclip] App connection unavailable: Installed MCP. Continuing this run without it; reconnect from Apps to restore access.\n",
+    }]);
+
     await expect(
       createManagedMcpRunConfig({
         db,

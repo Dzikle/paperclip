@@ -34,6 +34,7 @@ import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
+import { enrichRunContextBeforeDispatch } from "./run-context-enrichment.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
@@ -4482,11 +4483,45 @@ export async function revokeHeartbeatRunGatewayTokens(input: {
     );
 }
 
+export async function buildPaperclipNativeRuntimeMcpServers(input: {
+  db: Db;
+  agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "name">;
+  runId: string;
+  expectedAssignmentDigest?: string | null;
+  runtimeToken?: RuntimeMcpTokenOptions;
+  onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+}): Promise<AdapterRuntimeMcpServer[]> {
+  return await buildPaperclipRuntimeMcpServers({
+    db: input.db,
+    agent: input.agent,
+    runId: input.runId,
+    expectedAssignmentDigest: input.expectedAssignmentDigest,
+    runtimeToken: input.runtimeToken,
+    onUnavailableAssignedConnections: async (connections) => {
+      const names = connections
+        .map((connection) => connection.name)
+        .join(", ");
+      await input.onLog(
+        "stderr",
+        `[paperclip] App connection${connections.length === 1 ? "" : "s"} unavailable: ${names}. Continuing this run without ${connections.length === 1 ? "it" : "them"}; reconnect from Apps to restore access.\n`,
+      );
+    },
+  });
+}
+
+interface RuntimeMcpTokenOptions {
+  name: string;
+  clientLabel: string;
+  ownerNote: string;
+  expiresAt: Date;
+}
+
 export async function buildPaperclipRuntimeMcpServers(input: {
   db: Db;
   agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "name">;
   runId: string;
   expectedAssignmentDigest?: string | null;
+  runtimeToken?: RuntimeMcpTokenOptions;
   onUnavailableAssignedConnections?: (
     connections: Array<{ id: string; name: string }>,
   ) => void | Promise<void>;
@@ -4764,13 +4799,13 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     companyId: input.agent.companyId,
     gatewayId: gateway!.id,
     body: {
-      name: `Run ${input.runId.slice(0, 8)}`,
+      name: input.runtimeToken?.name ?? `Run ${input.runId.slice(0, 8)}`,
       subjectType: "heartbeat_run",
       subjectId: input.runId,
-      clientLabel: `${input.agent.name} heartbeat run`,
-      ownerNote: `Short-lived runtime MCP token for heartbeat run ${input.runId}.`,
+      clientLabel: input.runtimeToken?.clientLabel ?? `${input.agent.name} heartbeat run`,
+      ownerNote: input.runtimeToken?.ownerNote ?? `Short-lived runtime MCP token for heartbeat run ${input.runId}.`,
       allowedActions: ["tools/list", "tools/call"],
-      expiresAt: new Date(Date.now() + 60 * 60 * 1_000),
+      expiresAt: input.runtimeToken?.expiresAt ?? new Date(Date.now() + 60 * 60 * 1_000),
     },
     actor: { agentId: input.agent.id },
   });
@@ -23367,6 +23402,37 @@ export function heartbeatService(
               runtimeConfig,
               runtimeSkillEntries,
             });
+            await enrichRunContextBeforeDispatch({
+              db,
+              workerManager: options.pluginWorkerManager,
+              run,
+              issueId: issueRef.id,
+              adapterType: agent.adapterType,
+              context,
+              workspace: {
+                cwd: executionWorkspace.cwd,
+                repoUrl: executionWorkspace.repoUrl,
+                repoRef: executionWorkspace.repoRef,
+                branchName: executionWorkspace.branchName,
+              },
+              resolveRuntimeMcpServers: async (plugin) =>
+                await buildPaperclipNativeRuntimeMcpServers({
+                    db,
+                    agent,
+                    runId: run.id,
+                    expectedAssignmentDigest: nativeRuntimeContext.mcp.digest,
+                    onLog,
+                    runtimeToken: {
+                      name: `Enricher ${plugin.pluginId.slice(0, 8)}`,
+                      clientLabel: `${agent.name} pre-run enrichment`,
+                      ownerNote: `MCP access for enricher ${plugin.pluginId} on run ${run.id}.`,
+                      expiresAt: new Date(Date.now() + 5 * 60 * 1_000),
+                    },
+                  }),
+              releaseRuntimeMcpServers: async () => {
+                await revokeHeartbeatRunGatewayTokens({ db, companyId: agent.companyId, runId: run.id });
+              },
+            });
             const nativeExecutionWithCheckpoint =
               buildNativeExecutionWithCheckpoint({
                 previousRun: previousNativeRun,
@@ -23948,21 +24014,14 @@ export function heartbeatService(
               nativeExecution.runtimeContext.mcp.bindingId
                 ? nativeExecution.runtimeContext.mcp.digest
                 : null;
-            const nativeMcpServers = await buildPaperclipRuntimeMcpServers({
-              db,
-              agent,
-              runId: run.id,
-              expectedAssignmentDigest: expectedNativeMcpDigest,
-              onUnavailableAssignedConnections: async (connections) => {
-                const names = connections
-                  .map((connection) => connection.name)
-                  .join(", ");
-                await onLog(
-                  "stderr",
-                  `[paperclip] App connection${connections.length === 1 ? "" : "s"} unavailable: ${names}. Continuing this run without ${connections.length === 1 ? "it" : "them"}; reconnect from Apps to restore access.\n`,
-                );
-              },
-            });
+            const nativeMcpServers =
+              await buildPaperclipNativeRuntimeMcpServers({
+                db,
+                agent,
+                runId: run.id,
+                expectedAssignmentDigest: expectedNativeMcpDigest,
+                onLog,
+              });
             if ("runtimeContext" in nativeExecution) {
               if (nativeMcpServers.length > 1)
                 throw new Error(
@@ -24212,17 +24271,6 @@ export function heartbeatService(
             // adapters need it in their prompt, but the authoritative answers
             // remain on the interaction instead of being duplicated in the
             // heartbeat run snapshot.
-            const adapterContext: Record<string, unknown> = {
-              ...context,
-              ...(legacyQuestionResponse
-                ? {
-                    [PAPERCLIP_WAKE_PAYLOAD_KEY]: {
-                      ...parseObject(context[PAPERCLIP_WAKE_PAYLOAD_KEY]),
-                      questionResponse: legacyQuestionResponse,
-                    },
-                  }
-                : {}),
-            };
             const runtimeTools = createAdapterRuntimeToolAccess({
               agentId: agent.id,
               companyId: agent.companyId,
@@ -24239,11 +24287,51 @@ export function heartbeatService(
                 "runtime connection tools could not be delivered",
               );
             }
+            await enrichRunContextBeforeDispatch({
+              db,
+              workerManager: options.pluginWorkerManager,
+              run,
+              issueId: issueRef?.id ?? null,
+              adapterType: agent.adapterType,
+              context,
+              workspace: {
+                cwd: executionWorkspace.cwd,
+                repoUrl: executionWorkspace.repoUrl,
+                repoRef: executionWorkspace.repoRef,
+                branchName: executionWorkspace.branchName,
+              },
+              resolveRuntimeMcpServers: async (plugin) =>
+                await buildPaperclipRuntimeMcpServers({
+                  db,
+                  agent,
+                  runId: run.id,
+                  runtimeToken: {
+                    name: `Enricher ${plugin.pluginId.slice(0, 8)}`,
+                    clientLabel: `${agent.name} pre-run enrichment`,
+                    ownerNote: `MCP access for enricher ${plugin.pluginId} on run ${run.id}.`,
+                    expiresAt: new Date(Date.now() + 5 * 60 * 1_000),
+                  },
+                }),
+              releaseRuntimeMcpServers: async () => {
+                await revokeHeartbeatRunGatewayTokens({ db, companyId: agent.companyId, runId: run.id });
+              },
+            });
             const runtimeMcpServers = await buildPaperclipRuntimeMcpServers({
               db,
               agent,
               runId: run.id,
             });
+            const adapterContext: Record<string, unknown> = {
+              ...context,
+              ...(legacyQuestionResponse
+                ? {
+                    [PAPERCLIP_WAKE_PAYLOAD_KEY]: {
+                      ...parseObject(context[PAPERCLIP_WAKE_PAYLOAD_KEY]),
+                      questionResponse: legacyQuestionResponse,
+                    },
+                  }
+                : {}),
+            };
             const runtimeToolDelivery =
               adapter.runtimeToolDelivery ?? "invocation_context";
             if (runtimeTools && runtimeToolDelivery === "native_mcp") {
