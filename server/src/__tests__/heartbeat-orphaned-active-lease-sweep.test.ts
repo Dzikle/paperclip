@@ -127,7 +127,7 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
     heartbeatRunId: string | null;
     updatedAt: Date;
     provider?: string;
-    providerLeaseId?: string;
+    providerLeaseId?: string | null;
     status?: string;
   }): Promise<string> {
     const id = randomUUID();
@@ -139,7 +139,10 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
       status: input.status ?? "active",
       leasePolicy: "reuse_by_environment",
       provider: input.provider ?? "fake",
-      providerLeaseId: input.providerLeaseId ?? `sandbox://fake/${id}`,
+      providerLeaseId:
+        input.providerLeaseId === undefined
+          ? `sandbox://fake/${id}`
+          : input.providerLeaseId,
       acquiredAt: input.updatedAt,
       lastUsedAt: input.updatedAt,
       createdAt: input.updatedAt,
@@ -190,6 +193,27 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
     await heartbeatService(db).reapOrphanedRuns({ staleThresholdMs: 0 });
 
     expect(await leaseRow(leaseId)).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed" });
+  });
+
+  it.each([
+    { provider: "ssh", providerLeaseId: "unexpected-resource" },
+    { provider: "sandbox", providerLeaseId: "ssh://runner@example.test:22/shared-workspace" },
+  ])("does not bypass the shared-resource guard for malformed SSH lease identity ($provider)", async ({ provider, providerLeaseId }) => {
+    const { companyId, agentId, environmentId } = await seedCompanyAgentAndEnvironment();
+    await db.update(environments).set({ driver: "ssh" }).where(eq(environments.id, environmentId));
+    const runId = await insertHeartbeatRun({ companyId, agentId, status: "interrupted" });
+    const successorId = await insertHeartbeatRun({ companyId, agentId, status: "running" });
+    const leaseId = await insertActiveLease({ companyId, environmentId, heartbeatRunId: runId,
+      updatedAt: oldEnough(), provider, providerLeaseId });
+    await insertActiveLease({ companyId, environmentId, heartbeatRunId: successorId,
+      updatedAt: oldEnough(), provider, providerLeaseId });
+    await db.update(environmentLeases).set({ leasePolicy: "ephemeral", metadata: { driver: "ssh" } })
+      .where(eq(environmentLeases.id, leaseId));
+
+    const result = await heartbeatService(db).sweepOrphanedActiveLeases({ backoffMs: 0 });
+
+    expect(result).toEqual({ recovered: 0 });
+    expect(await leaseRow(leaseId)).toMatchObject({ status: "active", cleanupStatus: null });
   });
 
   it("test_flips_an_active_lease_when_its_run_is_failed", async () => {
@@ -481,6 +505,60 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
     expect(destroyRunLease).toHaveBeenCalledTimes(1);
     const row = await leaseRow(leaseId);
     expect(row?.status).toBe("expired");
+  });
+
+  it.each([
+    { driver: "local", providerLeaseId: null },
+    { driver: "ssh", providerLeaseId: "ssh://runner@example.test:22/shared-workspace" },
+  ])("releases a terminal $driver workspace lease without destroying a live successor's workspace", async ({ driver, providerLeaseId }) => {
+    const { companyId, agentId, environmentId } = await seedCompanyAgentAndEnvironment();
+    await db.update(environments).set({ driver }).where(eq(environments.id, environmentId));
+    const runId = await insertHeartbeatRun({ companyId, agentId, status: "interrupted" });
+    const successorId = await insertHeartbeatRun({ companyId, agentId, status: "running" });
+    const leaseId = await insertActiveLease({ companyId, environmentId, heartbeatRunId: runId, updatedAt: oldEnough(), provider: driver, providerLeaseId });
+    const successorLeaseId = await insertActiveLease({ companyId, environmentId, heartbeatRunId: successorId, updatedAt: oldEnough(), provider: driver, providerLeaseId });
+    for (const id of [leaseId, successorLeaseId]) {
+      await db.update(environmentLeases).set({ leasePolicy: "ephemeral", metadata: { driver } }).where(eq(environmentLeases.id, id));
+    }
+
+    const heartbeat = heartbeatService(db);
+    const sweeps = await Promise.all([
+      heartbeat.sweepOrphanedActiveLeases({ backoffMs: 0 }),
+      heartbeat.sweepOrphanedActiveLeases({ backoffMs: 0 }),
+    ]);
+    expect(sweeps.reduce((sum, result) => sum + result.recovered, 0)).toBe(1);
+    await heartbeat.sweepPendingCleanupLeases();
+    const released = await leaseRow(leaseId);
+    expect(released?.status).toBe("expired");
+    expect(released?.cleanupStatus).toBe("success");
+    expect(released?.releasedAt).toBeInstanceOf(Date);
+    expect((await leaseRow(successorLeaseId))?.status).toBe("active");
+    await heartbeat.sweepOrphanedActiveLeases({ backoffMs: 0 });
+    await heartbeat.sweepPendingCleanupLeases();
+    expect((await leaseRow(leaseId))?.releasedAt).toEqual(released?.releasedAt);
+    expect((await leaseRow(successorLeaseId))?.releasedAt).toBeNull();
+  });
+
+  it.each([
+    { driver: "local", providerLeaseId: null },
+    { driver: "ssh", providerLeaseId: "ssh://runner@example.test:22/shared-workspace" },
+  ])("repairs an already capped pending $driver workspace lease without an environment row", async ({ driver, providerLeaseId }) => {
+    const { companyId, agentId } = await seedCompanyAgentAndEnvironment();
+    const runId = await insertHeartbeatRun({ companyId, agentId, status: "failed" });
+    const leaseId = await insertActiveLease({ companyId, environmentId: null, heartbeatRunId: runId, updatedAt: oldEnough(), provider: driver, providerLeaseId, status: "pending_cleanup" });
+    await db.update(environmentLeases).set({
+      leasePolicy: "ephemeral", cleanupStatus: "failed",
+      metadata: { driver, pendingCleanupRetryAttempts: 100 },
+    }).where(eq(environmentLeases.id, leaseId));
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.sweepPendingCleanupLeases();
+    const released = await leaseRow(leaseId);
+    expect(released?.status).toBe("expired");
+    expect(released?.cleanupStatus).toBe("success");
+    expect(released?.releasedAt).toBeInstanceOf(Date);
+    await heartbeat.sweepPendingCleanupLeases();
+    expect((await leaseRow(leaseId))?.releasedAt).toEqual(released?.releasedAt);
   });
 
   it("test_logs_a_distinct_error_kind_and_no_exception_field_when_the_sweep_fails", async () => {
