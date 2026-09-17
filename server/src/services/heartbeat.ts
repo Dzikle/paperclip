@@ -18190,6 +18190,32 @@ export function heartbeatService(
       );
   }
 
+  function isHostWorkspaceLease(lease: typeof environmentLeases.$inferSelect): boolean {
+    // These built-in drivers release only a logical run lease. Their provider
+    // id can name a shared host/workspace, not a sandbox to destroy. Classify
+    // from the recorded driver, never from a provider's potentially local name.
+    return lease.leasePolicy === "ephemeral"
+      && (lease.metadata?.driver === "local" || lease.metadata?.driver === "ssh");
+  }
+
+  async function releaseOrphanedHostWorkspaceLease(
+    lease: typeof environmentLeases.$inferSelect,
+  ): Promise<boolean> {
+    const now = new Date();
+    const released = await db.update(environmentLeases).set({
+      status: "expired",
+      cleanupStatus: "success",
+      failureReason: "orphaned_host_workspace_lease_recovered",
+      releasedAt: sql`coalesce(${environmentLeases.releasedAt}, ${now.toISOString()}::timestamptz)`,
+      lastUsedAt: now,
+      updatedAt: now,
+    }).where(and(
+      eq(environmentLeases.id, lease.id),
+      eq(environmentLeases.status, lease.status),
+    )).returning({ id: environmentLeases.id });
+    return released.length > 0;
+  }
+
   // An active lease is reachable only while its heartbeat run keeps the
   // running status. The reaper writes the run status and the lease release as
   // two separate statements, so a restart between them can leave a terminal
@@ -18229,6 +18255,10 @@ export function heartbeatService(
 
     let recovered = 0;
     for (const { lease } of rows) {
+      if (isHostWorkspaceLease(lease)) {
+        if (await releaseOrphanedHostWorkspaceLease(lease)) recovered += 1;
+        continue;
+      }
       // A provider resource id names one physical sandbox. A different lease
       // row can still hold that same resource in a live status, so this sweep
       // must not tear down a sandbox that a different lease still owns.
@@ -18344,6 +18374,13 @@ export function heartbeatService(
     let destroyed = 0;
     let capped = 0;
     for (const row of rows) {
+      // Repair host leases already sent to sandbox teardown by an earlier
+      // recovery. No provider RPC or retry budget is needed, even when the
+      // environment was deleted or the old teardown attempts reached the cap.
+      if (isHostWorkspaceLease(row)) {
+        if (await releaseOrphanedHostWorkspaceLease(row)) destroyed += 1;
+        continue;
+      }
       const metadata = { ...(row.metadata ?? {}) } as Record<string, unknown>;
       const attempts = readPendingCleanupRetryAttempts(metadata);
 
