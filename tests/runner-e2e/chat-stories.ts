@@ -4,6 +4,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { sendChatMessage, type ChatFlowInput, type ChatIssue, type ChatRun } from "./chat-flow.js";
 import { setSettingsToggle } from "./settings-toggle.js";
+import { resolveDefaultAgentWorkspaceDir } from "../../server/src/home-paths.js";
 
 type Comment = { id: string; body: string; authorAgentId?: string; createdByRunId?: string };
 type Context = {
@@ -69,7 +70,13 @@ export async function prepareChatBrief(workspacePath: string, nonce: string) {
 
 export async function runChatInterruption(context: Context & { refreshIssue(): Promise<void> }) {
   const { input, marker, idle, allRuns, comments } = context;
-  const { gate, ready, scriptPath } = await prepareChatBrief(input.workspacePath, input.nonce);
+  // Unprojected host /tmp files are intentionally hidden from native Codex.
+  // These projectless chats use the normal agent-home workspace, not the
+  // harness's separate project fixture directory. Keep the asset inside it.
+  const agentWorkspace = resolveDefaultAgentWorkspaceDir(input.fixtures.agent.id);
+  const relative = path.relative(path.dirname(input.workspacePath), agentWorkspace);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("Chat fixture workspace escaped the isolated instance");
+  const { gate, ready, scriptPath } = await prepareChatBrief(agentWorkspace, input.nonce);
   const reference = `BRIEF${randomUUID().replaceAll("-", "")}`;
   // Real provider tool execution waits on an ordinary fixture file. No runner
   // hooks, provider results, database records, or task outcomes are fabricated.
@@ -90,6 +97,7 @@ export async function runChatInterruption(context: Context & { refreshIssue(): P
       boundaryRun = (await allRuns()).find(run => run.status === "running");
       return Boolean(boundaryRun);
     }, { timeout: 120_000 }).toBe(true);
+    expect(boundaryRun!.contextSnapshot?.paperclipWorkspace).toMatchObject({ cwd: agentWorkspace });
     await context.refreshIssue();
     await sendChatMessage(input.page, followup);
     await expect.poll(async () => (await comments()).filter(comment => !comment.authorAgentId && comment.body === followup).length,

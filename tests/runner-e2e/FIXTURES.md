@@ -196,7 +196,9 @@ comment request after the real server has committed it. Retain its request ID
 and replay that same request through the public API after restarting the server.
 Never fabricate tool results or repair task state after a failed assertion.
 
-`chat-stories.ts` uses an ordinary local file wait as a deterministic interruption
+`chat-stories.ts` seeds an ordinary file wait in the isolated agent's actual
+home workspace; native Codex intentionally cannot see arbitrary host temp files.
+The observed run workspace must match the fixture location. This is a deterministic interruption
 boundary. The real provider command writes the readiness file and waits at most
 two minutes. The harness must persist the next browser message while the same
 run is active before supplying the brief. Always release the wait in `finally`.
