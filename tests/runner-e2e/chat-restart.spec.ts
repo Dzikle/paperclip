@@ -25,7 +25,9 @@ test("unloads the old browser client before server restart and opens the new doc
     await page.goto(url, { waitUntil: "commit" });
     await expect(page.getByTestId("composer")).toHaveValue("server generation 2");
   } finally {
-    server.closeAllConnections();
-    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    if (server.listening) {
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    }
   }
 });
