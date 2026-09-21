@@ -83,7 +83,7 @@ pnpm test:e2e:runner -- --suite daytona-warm-continuity
 pnpm test:e2e:runner -- --all
 ```
 
-The catalog contains eight suites, including the explicit-only everyday suite. `core-compatibility` (**Core Runner
+The catalog contains nine suites, including the explicit-only suites. `core-compatibility` (**Core Runner
 Compatibility**) is seven major runner profiles × local/Daytona × three
 workflows: 42 cells. Its cases are:
 
@@ -210,6 +210,9 @@ instead of the original Monday. The oracle permits either steering the active
 run or one queued successor, but rejects missing/duplicate comments, failed or
 unfinished runs, stale plan contents, and unintended tasks/projects. This does
 not qualify active-task reassignment or worker-crash recovery.
+The maximum run count remains the cost estimate; the shared harness honors the
+one-run minimum only for these two interruption cases. Exactly one reply may
+consume the follow-up marker, and it must be attributed to the final provider run.
 
 ```sh
 pnpm test:e2e:runner -- --list --suite agent-chat-hardening
@@ -247,7 +250,8 @@ Missing provider credentials fail paid preflight and are not passing coverage.
 
 The default `--all` selection is 171 cells (148 local and 23 Daytona) and 371
 expected paid agent turns. The explicit-only everyday suite adds 38 catalog cells
-and chat hardening adds 18. Both are excluded from `--all`. The full catalog has 227 cells.
+and chat hardening adds 18; chat stories adds six. All three are excluded from
+`--all`. The full catalog has 233 cells.
 Follow-up steps remain ordered within their cell; all other
 cells are independent. Narrow selectors are strongly recommended while
 developing fixtures.

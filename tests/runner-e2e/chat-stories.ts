@@ -1,8 +1,9 @@
 import { expect } from "@playwright/test";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { sendChatMessage, type ChatFlowInput, type ChatIssue, type ChatRun } from "./chat-flow.js";
+import { setSettingsToggle } from "./settings-toggle.js";
 
 type Comment = { id: string; body: string; authorAgentId?: string; createdByRunId?: string };
 type Context = {
@@ -19,8 +20,7 @@ export async function enableChatThroughSettings(input: ChatFlowInput) {
 async function setChatEnabled(input: ChatFlowInput, enabled: boolean) {
   await input.page.goto(`/${input.fixtures.company.issuePrefix}/company/settings/instance/experimental`, { waitUntil: "domcontentloaded" });
   const toggle = input.page.getByRole("switch", { name: "Toggle agent chat experimental setting" });
-  await expect(toggle).toBeVisible();
-  await toggle.setChecked(enabled);
+  await setSettingsToggle(toggle, enabled);
   await expect.poll(async () => (await input.api.get<{ enableAgentChat: boolean }>("/api/instance/settings/experimental")).enableAgentChat).toBe(enabled);
 }
 
@@ -39,12 +39,17 @@ export function assertInterruptedChat(input: {
   expect(final).toBeTruthy();
   expect(final.body).toContain(input.reference);
   expect(final.body).toContain(input.marker);
+  expect(replies.filter(reply => reply.body.includes(input.marker))).toHaveLength(1);
   expect(input.runs.length).toBeGreaterThanOrEqual(1);
   expect(input.runs.length).toBeLessThanOrEqual(2);
   expect(input.runs.every(run => run.status === "succeeded" && run.runtimeMode === "native")).toBe(true);
   expect(new Set(input.runs.map(run => run.id)).size).toBe(input.runs.length);
   expect(input.runs.every(run => run.agentId === input.boundaryRun.agentId && run.contextSnapshot?.issueId === input.issueId)).toBe(true);
   expect(final.authorAgentId).toBe(input.boundaryRun.agentId);
+  const responseRun = input.runs.length === 1
+    ? input.boundaryRun
+    : input.runs.find(run => run.id !== input.boundaryRun.id)!;
+  expect(final.createdByRunId).toBe(responseRun.id);
   expect(input.runs.some(run => run.id === input.boundaryRun.id)).toBe(true);
   if (input.revisedPlan !== undefined) {
     const body = input.revisedPlan.trim().replace(/^```(?:json)?\s*/, "").replace(/\s*```$/, "");
@@ -52,15 +57,25 @@ export function assertInterruptedChat(input: {
   }
 }
 
+export async function prepareChatBrief(workspacePath: string, nonce: string) {
+  await mkdir(workspacePath, { recursive: true });
+  const gate = path.join(workspacePath, `chat-brief-${nonce}.txt`);
+  const ready = `${gate}.waiting`;
+  const scriptPath = path.join(workspacePath, `wait-for-brief-${nonce}.cjs`);
+  const script = `const fs=require("node:fs");fs.writeFileSync(${JSON.stringify(ready)},"waiting");const end=Date.now()+120000;const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(gate)})){console.log(fs.readFileSync(${JSON.stringify(gate)},"utf8"));clearInterval(timer)}else if(Date.now()>end){clearInterval(timer);process.exitCode=1}},100);`;
+  await writeFile(scriptPath, script, "utf8");
+  return { gate, ready, scriptPath };
+}
+
 export async function runChatInterruption(context: Context & { refreshIssue(): Promise<void> }) {
   const { input, marker, idle, allRuns, comments } = context;
-  const gate = path.join(input.workspacePath, `chat-brief-${input.nonce}.txt`);
-  const ready = `${gate}.waiting`;
+  const { gate, ready, scriptPath } = await prepareChatBrief(input.workspacePath, input.nonce);
   const reference = `BRIEF${randomUUID().replaceAll("-", "")}`;
   // Real provider tool execution waits on an ordinary fixture file. No runner
   // hooks, provider results, database records, or task outcomes are fabricated.
-  const script = `const fs=require("node:fs");fs.writeFileSync(${JSON.stringify(ready)},"waiting");const end=Date.now()+120000;const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(gate)})){console.log(fs.readFileSync(${JSON.stringify(gate)},"utf8"));clearInterval(timer)}else if(Date.now()>end){clearInterval(timer);process.exitCode=1}},100);`;
-  const command = `node -e '${script.replaceAll("'", "'\\''")}'`;
+  // Keep JavaScript in a seeded fixture file: rich-text input serializes raw
+  // operators as Markdown escapes, which should not alter a timing fixture.
+  const command = `node ${scriptPath}`;
   const first = `Our launch is planned for Monday. First run this bounded command to wait for the brief reference file I am supplying: ${command}\nAfter it returns, acknowledge the reference from the file here. This is discussion only; do not create projects or tasks.`;
   const revise = input.execution.task.id === "revise-while-running";
   const followup = revise
@@ -114,6 +129,8 @@ export async function runChatSettingsLifecycle(context: Context) {
   await idle(1);
   const before = { issue: context.issue(), comments: await comments(), runs: await allRuns() };
   await setChatEnabled(input, false);
+  // Full document navigation clears the client query cache. Unlike SPA
+  // navigation, this verifies the disabled entry page without cached history.
   await input.page.goto(route, { waitUntil: "domcontentloaded" });
   await expect(input.page.getByText(/Agent Chat is disabled/)).toBeVisible();
   const blocked = await input.api.request.post(`/api/issues/${before.issue.id}/comments`, { data: { body: `DISABLED${marker}` } });

@@ -966,7 +966,7 @@ export const runnerSuites: readonly RunnerSuiteFixture[] = [
     profiles: runnerProfiles.filter(profile => ["runner-codex", "runner-acpx-claude"].includes(profile.id))
       .map(profile => productionStoryProfile(defaultPermissionProfile(profile))),
     environments: [localEnvironment], tasks: chatStoryTasks, expectedMatrixSize: 6,
-    definitionMetadata: { version: 1, setup: "configured-native-agent", permissions: "production-defaults", interruptionBoundary: "provider-file-wait-active", grading: "persisted-comments-and-plan", scheduling: "explicit-only" },
+    definitionMetadata: { version: 2, setup: "configured-native-agent", permissions: "production-defaults", interruptionBoundary: "provider-file-wait-active", grading: "persisted-comments-and-plan-run-attributed", scheduling: "explicit-only" },
   },
   ...(process.env.PAPERCLIP_RUNNER_E2E_CONNECTION_REVIEWS === "1" ? [connectionReviewSuite] : []),
   {
@@ -1042,6 +1042,7 @@ export function suiteDefinitionHash(suite: RunnerSuiteFixture) {
           id: task.id,
           flow: task.flow,
           expectedRunCount: task.expectedRunCount,
+          ...(task.minimumExpectedRunCount === undefined ? {} : { minimumExpectedRunCount: task.minimumExpectedRunCount }),
           restartServerBeforeQuestionAnswer:
             task.restartServerBeforeQuestionAnswer ?? false,
         })),

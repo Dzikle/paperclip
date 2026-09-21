@@ -10,6 +10,7 @@ import { isBlockedUnstartedWake } from "./non-execution-wake.js";
 import { chatMarker } from "./chat-cases.js";
 import { assertChatRememberedAfterRestart, assertChatStartupStopped, isChatStopReady, runChatHardeningFlow } from "./chat-hardening.js";
 import { enableChatThroughSettings, runChatInterruption, runChatSettingsLifecycle } from "./chat-stories.js";
+import { matchesRunCount, minimumRunCount } from "./run-count.js";
 
 // Public API observations only: this driver never fabricates provider results or writes DB state.
 export interface ChatIssue {
@@ -919,12 +920,8 @@ export async function runChatFlow(input: ChatFlowInput) {
         projects,
       });
     }
-    await idle(interruptionCase ? 1 : execution.task.expectedRunCount);
-    // The interruption oracle already proves delivery and bounds one steered
-    // run or two sequential runs. Other stories keep their exact run counts.
-    if (!interruptionCase) expect(runs.filter((run) => !isResetRun(run))).toHaveLength(
-        execution.task.expectedRunCount,
-      );
+    await idle(minimumRunCount(execution.task));
+    expect(matchesRunCount(execution.task, runs.filter((run) => !isResetRun(run)).length)).toBe(true);
     for (const run of runs.filter((run) => !isResetRun(run))) {
       expect(run.runtimeMode).toBe(execution.profile.expectedRuntimeMode);
       expect(run.status).toBe(

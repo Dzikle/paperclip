@@ -51,7 +51,7 @@ export const chatStoryTasks = buildChatTasks([
   ["enable-disable-resume", "Enable Agent Chat, pause access, and resume preserved history", 2],
   ["followup-while-running", "Deliver a follow-up while a provider turn is running", 2],
   ["revise-while-running", "Change instructions during active work and save the updated plan", 2],
-]);
+]).map(task => ({ ...task, ...(task.id === "enable-disable-resume" ? {} : { minimumExpectedRunCount: 1 }) }));
 
 export function chatNeedsApiTools(suiteId: string, caseId: string): boolean {
   return suiteId === "agent-chat-hardening" && ["hire-delegate-reuse", "blocked-status-review"].includes(caseId);
