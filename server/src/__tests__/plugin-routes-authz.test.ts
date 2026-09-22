@@ -531,6 +531,47 @@ describe.sequential("plugin local folder routes", () => {
   });
 });
 
+describe.sequential("plugin run-context enrichment approval", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockRegistry.getById.mockResolvedValue({
+      id: pluginId,
+      pluginKey: "paperclip.example",
+      status: "ready",
+      manifestJson: { capabilities: ["agent.run.enrich"] },
+    });
+    mockRegistry.getCompanySettings.mockResolvedValue({
+      enabled: false,
+      settingsJson: { localFolders: { content: { path: "/tmp/content" } } },
+    });
+    mockRegistry.upsertCompanySettings.mockImplementation(async (_pluginId, _companyId, input) => input);
+  });
+
+  it("rejects enrichment approval by a non-admin board member", async () => {
+    const { app } = await createApp(boardActor());
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/run-context-enrichment`)
+      .send({ enabled: true });
+    expect(res.status).toBe(403);
+    expect(mockRegistry.upsertCompanySettings).not.toHaveBeenCalled();
+  });
+
+  it("lets an instance admin explicitly approve enrichment without enabling a disabled plugin", async () => {
+    const { app } = await createApp(boardActor({ isInstanceAdmin: true }));
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyA}/run-context-enrichment`)
+      .send({ enabled: true });
+    expect(res.status).toBe(200);
+    expect(mockRegistry.upsertCompanySettings).toHaveBeenCalledWith(pluginId, companyA, {
+      enabled: false,
+      settingsJson: {
+        localFolders: { content: { path: "/tmp/content" } },
+        runContextEnrichmentEnabled: true,
+      },
+    });
+  });
+});
+
 describe.sequential("plugin tool and bridge authz", () => {
   beforeEach(() => {
     vi.clearAllMocks();

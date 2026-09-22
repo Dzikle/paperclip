@@ -187,6 +187,7 @@ export async function enrichRunContextBeforeDispatch(input: {
         pluginKey: plugins.pluginKey,
         version: plugins.version,
         manifest: plugins.manifestJson,
+        companySettings: pluginCompanySettings.settingsJson,
       })
       .from(plugins)
       .innerJoin(
@@ -204,7 +205,8 @@ export async function enrichRunContextBeforeDispatch(input: {
       )
       .orderBy(asc(plugins.installOrder), asc(plugins.id))
   ).filter((plugin) =>
-    plugin.manifest.capabilities.includes("agent.run.enrich"),
+    plugin.manifest.capabilities.includes("agent.run.enrich") &&
+    plugin.companySettings.runContextEnrichmentEnabled === true,
   );
 
   if (candidates.length === 0) return null;

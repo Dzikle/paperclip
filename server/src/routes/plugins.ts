@@ -2913,6 +2913,45 @@ export function pluginRoutes(
     res.json(status);
   });
 
+  router.put("/plugins/:pluginId/companies/:companyId/run-context-enrichment", async (req, res) => {
+    assertInstanceAdmin(req);
+    assertPluginManagementVisible();
+    const { pluginId, companyId } = req.params;
+    const plugin = await resolvePlugin(registry, pluginId);
+    if (!plugin) {
+      res.status(404).json({ error: "Plugin not found" });
+      return;
+    }
+    if (!plugin.manifestJson.capabilities.includes("agent.run.enrich")) {
+      res.status(400).json({ error: "Plugin does not declare agent.run.enrich" });
+      return;
+    }
+    const enabled = (req.body as { enabled?: unknown } | undefined)?.enabled;
+    if (typeof enabled !== "boolean") {
+      res.status(400).json({ error: '"enabled" must be a boolean' });
+      return;
+    }
+    const existing = await registry.getCompanySettings(plugin.id, companyId);
+    await registry.upsertCompanySettings(plugin.id, companyId, {
+      enabled: existing?.enabled ?? true,
+      settingsJson: { ...existing?.settingsJson, runContextEnrichmentEnabled: enabled },
+    });
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      action: enabled ? "plugin.run_context_enrichment.approved" : "plugin.run_context_enrichment.revoked",
+      entityType: "plugin",
+      entityId: plugin.id,
+      details: { pluginId: plugin.id, pluginKey: plugin.pluginKey },
+    });
+    res.json({ pluginId: plugin.id, companyId, enabled });
+  });
+
   router.put("/plugins/:pluginId/companies/:companyId/local-folders/:folderKey", async (req, res) => {
     assertBoardOrgAccess(req);
     assertPluginManagementVisible();

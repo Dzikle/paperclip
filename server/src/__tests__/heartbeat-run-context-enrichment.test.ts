@@ -114,7 +114,7 @@ describeEmbeddedPostgres("heartbeat pre-run context enrichment", () => {
     expect(resolveRuntimeMcpServers).not.toHaveBeenCalled();
   });
 
-  it("does not invoke an enricher without explicit company enablement", async () => {
+  it("does not treat an ordinary company settings row as enrichment approval", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const pluginId = randomUUID();
@@ -158,6 +158,12 @@ describeEmbeddedPostgres("heartbeat pre-run context enrichment", () => {
       },
       status: "ready",
       installOrder: 1,
+    });
+    await db.insert(pluginCompanySettings).values({
+      companyId,
+      pluginId,
+      enabled: true,
+      settingsJson: { localFolders: { content: { path: "/tmp/content" } } },
     });
     await db.insert(heartbeatRuns).values({
       id: runId,
@@ -251,7 +257,7 @@ describeEmbeddedPostgres("heartbeat pre-run context enrichment", () => {
       companyId,
       pluginId,
       enabled: true,
-      settingsJson: {},
+      settingsJson: { runContextEnrichmentEnabled: true },
     });
     await db.insert(heartbeatRuns).values({
       id: runId,
@@ -331,7 +337,7 @@ describeEmbeddedPostgres("heartbeat pre-run context enrichment", () => {
       companyId,
       pluginId,
       enabled: true,
-      settingsJson: {},
+      settingsJson: { runContextEnrichmentEnabled: true },
     });
     await db.insert(heartbeatRuns).values({
       id: runId,
@@ -423,7 +429,7 @@ describeEmbeddedPostgres("heartbeat pre-run context enrichment", () => {
       companyId,
       pluginId,
       enabled: true,
-      settingsJson: {},
+      settingsJson: { runContextEnrichmentEnabled: true },
     });
     await db.insert(heartbeatRuns).values({
       id: runId,
@@ -527,7 +533,7 @@ describeEmbeddedPostgres("heartbeat pre-run context enrichment", () => {
       companyId,
       pluginId,
       enabled: true,
-      settingsJson: {},
+      settingsJson: { runContextEnrichmentEnabled: true },
     });
     await db.insert(agents).values({
       id: agentId,

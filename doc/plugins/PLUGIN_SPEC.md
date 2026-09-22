@@ -646,14 +646,14 @@ The worker executes the tool and returns a typed result (string content, structu
 
 Runs after Paperclip has admitted and prepared a run, but before it invokes the selected adapter. This is a narrow enrichment stage, not a nested executor: Paperclip retains the run identity, selected adapter, permission checks, budget checks, and completion semantics.
 
-Only ready, company-enabled plugins that declare `agent.run.enrich` participate. The host invokes them in stable install order and provides:
+Only ready, company-enabled plugins that declare `agent.run.enrich` and have an explicit per-company enrichment approval participate. An instance administrator grants or revokes that approval with `PUT /api/plugins/:pluginId/companies/:companyId/run-context-enrichment` and a boolean `enabled` body. An ordinary plugin company settings row (including one created by local-folder setup) does not approve enrichment. The host invokes approved plugins in stable install order and provides:
 
 - company, run, agent, issue, and selected-adapter identity;
 - a read-only task-context snapshot;
 - the resolved execution workspace;
 - only the run-scoped MCP servers already authorized for the selected agent.
 
-Each invocation receives a distinct MCP token with the agent's effective tool profile. The token expires within five minutes and the host revokes it when the hook returns, including on failure. The selected adapter receives a separately minted token. Plugins must not persist or forward these credentials.
+Each invocation receives a distinct MCP token with the agent's effective tool profile. The token expires within five minutes and the host revokes it when the hook returns, including on failure. The selected adapter receives a separately minted token. Enrichment workers are administrator-installed code, not an untrusted-code sandbox; administrators must approve the plugin's declared capability and each company's enrichment use. Plugins must not persist or forward these credentials.
 
 Each plugin returns bounded prompt Markdown, a content-addressed artifact descriptor (`ref`, `sha256`, optional media type and byte size), and bounded metadata. The host validates and persists the result on the same run before adapter dispatch. The snapshot retains the bounded prompt separately so recovery can reapply it if task text is rebuilt; reapplication is idempotent and the hook is not invoked again. A declared enricher that is unavailable or returns invalid/unbounded data fails the run closed.
 
