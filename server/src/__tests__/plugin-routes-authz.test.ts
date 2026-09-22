@@ -556,6 +556,15 @@ describe.sequential("plugin run-context enrichment approval", () => {
     expect(mockRegistry.upsertCompanySettings).not.toHaveBeenCalled();
   });
 
+  it("rejects enrichment approval outside an instance admin's company access", async () => {
+    const { app } = await createApp(boardActor({ isInstanceAdmin: true }));
+    const res = await request(app)
+      .put(`/api/plugins/${pluginId}/companies/${companyB}/run-context-enrichment`)
+      .send({ enabled: true });
+    expect(res.status).toBe(403);
+    expect(mockRegistry.upsertCompanySettings).not.toHaveBeenCalled();
+  });
+
   it("lets an instance admin explicitly approve enrichment without enabling a disabled plugin", async () => {
     const { app } = await createApp(boardActor({ isInstanceAdmin: true }));
     const res = await request(app)
