@@ -1526,6 +1526,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
 const INSTANCE_ADMIN_OPERATIONS = new Set([
   "POST /api/companies",
   "POST /api/plugins/install",
+  "PUT /api/plugins/{pluginId}/companies/{companyId}/run-context-enrichment",
   "POST /api/instance/database-backups",
   "POST /api/admin/users/{userId}/promote-instance-admin",
   "POST /api/admin/users/{userId}/demote-instance-admin",
@@ -10021,6 +10022,21 @@ const pluginLocalFolderRequestSchema = z.object({
   access: z.enum(["read", "readWrite"]).optional(),
   requiredDirectories: z.array(z.string()).optional(),
   requiredFiles: z.array(z.string()).optional(),
+});
+
+registerCurrentRoute({
+  method: "put",
+  path: "/api/plugins/{pluginId}/companies/{companyId}/run-context-enrichment",
+  tags: ["plugins"],
+  summary: "Approve or revoke a plugin's run-context enrichment for a company",
+  body: z.object({ enabled: z.boolean() }),
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+  },
 });
 
 for (const route of [

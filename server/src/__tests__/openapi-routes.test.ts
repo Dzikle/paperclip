@@ -225,6 +225,19 @@ function loadSpecRoutes() {
 }
 
 describe("openapi routes", () => {
+  it("documents instance-admin approval of run-context enrichment", () => {
+    const { spec } = loadSpecRoutes();
+    const operation = spec.paths["/api/plugins/{pluginId}/companies/{companyId}/run-context-enrichment"]?.put;
+    expect(operation).toBeDefined();
+    expect(operation["x-paperclip-authorization"]).toEqual({ actor: "board", instanceAdmin: true });
+    expect(operation.security).toEqual([{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }]);
+    expect(operation.requestBody.content["application/json"].schema).toMatchObject({
+      required: ["enabled"],
+      properties: { enabled: { type: "boolean" } },
+    });
+    expect(operation.responses["403"]).toBeDefined();
+  });
+
   it("documents personal board-only announcements and private responses", () => {
     const { spec } = loadSpecRoutes();
     const current = spec.paths["/api/announcements/current"].get;
