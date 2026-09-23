@@ -574,6 +574,7 @@ import { parseExecutionPolicyBootstrapEnv } from "./execution-policy-bootstrap.j
 import { retryChatControlAdmission } from "./chat-control-admission-retry.js";
 import {
   environmentRuntimeService,
+  isLogicalSshWorkspaceLease,
   type ProviderResourceDisposition,
 } from "./environment-runtime.js";
 import { skillVersionSelectionMap } from "./runtime-skill-selections.js";
@@ -18368,7 +18369,11 @@ export function heartbeatService(
       // A provider resource id names one physical sandbox. A different lease
       // row can still hold that same resource in a live status, so this sweep
       // must not tear down a sandbox that a different lease still owns.
-      if (lease.provider && lease.providerLeaseId) {
+      // SSH provider ids name shared host workspaces, not disposable provider
+      // resources. Let the SSH driver perform its logical-only cleanup even
+      // while a successor uses that same workspace.
+      const isLogicalSshLease = isLogicalSshWorkspaceLease(lease);
+      if (!isLogicalSshLease && lease.provider && lease.providerLeaseId) {
         const [otherOwner] = await db
           .select({ id: environmentLeases.id })
           .from(environmentLeases)

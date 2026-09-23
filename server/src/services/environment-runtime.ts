@@ -748,6 +748,21 @@ export type ProviderResourceDisposition =
   | "stop_and_retain"
   | "destroy";
 
+export function isLogicalSshWorkspaceLease(lease: {
+  leasePolicy: string;
+  provider: string | null;
+  providerLeaseId: string | null;
+  metadata: Record<string, unknown> | null;
+}): boolean {
+  return (
+    lease.leasePolicy === "ephemeral" &&
+    lease.metadata?.driver === "ssh" &&
+    lease.provider === "ssh" &&
+    typeof lease.providerLeaseId === "string" &&
+    lease.providerLeaseId.startsWith("ssh://")
+  );
+}
+
 const DEFAULT_PLUGIN_SANDBOX_WORKER_READY_TIMEOUT_MS = 5_000;
 const DEFAULT_PLUGIN_SANDBOX_WORKER_READY_POLL_MS = 100;
 
@@ -1206,6 +1221,15 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
 
     async releaseRunLease(input) {
       return await environmentsSvc.releaseLease(input.lease.id, input.status);
+    },
+
+    async retryPendingSandboxTeardown({ lease }) {
+      // SSH leases track run ownership of a host workspace; they do not own a
+      // disposable provider resource or remote directory. Recovery therefore
+      // completes only the logical lease and must never tear down the host.
+      if (!isLogicalSshWorkspaceLease(lease)) {
+        throw new Error("SSH lease cleanup cannot release an unknown provider resource.");
+      }
     },
 
     async realizeWorkspace(input) {
