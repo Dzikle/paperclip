@@ -614,12 +614,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       env.PAPERCLIP_OPENCODE_PRINT_LOGS ?? process.env.PAPERCLIP_OPENCODE_PRINT_LOGS,
     );
     const buildArgs = (resumeSessionId: string | null) => {
-      const args = ["run", "--format", "json"];
+      // OpenCode's session directory can prefer inherited PWD over spawn cwd.
+      const args = ["run", "--format", "json", "--dir", effectiveExecutionCwd];
       if (printLogs) args.push("--print-logs");
       if (resumeSessionId) args.push("--session", resumeSessionId);
       if (model) args.push("--model", model);
       if (variant) args.push("--variant", variant);
-      if (extraArgs.length > 0) args.push(...extraArgs);
+      for (let index = 0; index < extraArgs.length; index += 1) {
+        const arg = extraArgs[index];
+        if (arg === "--") {
+          args.push(...extraArgs.slice(index));
+          break;
+        }
+        if (arg === "--dir" || arg.startsWith("--dir=")) {
+          const requestedCwd = arg === "--dir" ? extraArgs[++index] : arg.slice("--dir=".length);
+          if (requestedCwd !== effectiveExecutionCwd) {
+            throw new Error("OpenCode --dir must match the resolved execution workspace; configure cwd or the execution target instead.");
+          }
+          continue;
+        }
+        args.push(arg);
+      }
       return args;
     };
 
