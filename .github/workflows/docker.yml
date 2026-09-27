@@ -199,6 +199,10 @@ jobs:
           echo "last=${last}" >> "$GITHUB_OUTPUT"
           echo "count=${count}" >> "$GITHUB_OUTPUT"
 
+      - name: Normalize registry image name
+        id: registry_image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
       # Lane tag mapping: nightly/v* tags publish `:nightly`, and only
       # stable v* tags move `:latest` and the versioned tags.
       # `:sha-<short>` is published on every build. `:canary` is
@@ -209,7 +213,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ steps.registry_image.outputs.name }}
           tags: |
             type=raw,value=nightly,enable=${{ startsWith(github.ref, 'refs/tags/nightly/v') }}
             type=raw,value=beta,enable=${{ startsWith(github.ref, 'refs/tags/beta/v') }}
@@ -237,7 +241,7 @@ jobs:
           # By digest, not by tag: two runners cannot each push the same tag
           # and end up with a manifest list. Each leg publishes an untagged
           # image and `merge` names them together.
-          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ steps.registry_image.outputs.name }},push-by-digest=true,name-canonical=true,push=true
           # Registry-backed BuildKit cache instead of type=gha: the Actions
           # cache is capped at 10GB per repo, and two multi-arch mode=max jobs
           # evict each other, so most builds ran effectively cold. The cache
@@ -246,8 +250,8 @@ jobs:
           #
           # Per-arch refs now the legs are separate runners: a shared ref would
           # have each leg overwrite the other's cache on every build.
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache-${{ matrix.arch }}
-          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache-${{ matrix.arch }},mode=max
+          cache-from: type=registry,ref=${{ steps.registry_image.outputs.name }}:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ steps.registry_image.outputs.name }}:buildcache-${{ matrix.arch }},mode=max
           labels: ${{ steps.meta.outputs.labels }}
 
       # The digest is the only thing `merge` needs from this job. Carried as an
@@ -315,6 +319,10 @@ jobs:
           echo "last=${last}" >> "$GITHUB_OUTPUT"
           echo "count=${count}" >> "$GITHUB_OUTPUT"
 
+      - name: Normalize registry image name
+        id: registry_image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
       # Same lane mapping as the build job; this is where it is actually
       # applied, since the legs push untagged. `:canary` is deliberately
       # absent, exactly as in the build job's mapping: the channel tag is
@@ -324,7 +332,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ steps.registry_image.outputs.name }}
           tags: |
             type=raw,value=nightly,enable=${{ startsWith(github.ref, 'refs/tags/nightly/v') }}
             type=raw,value=beta,enable=${{ startsWith(github.ref, 'refs/tags/beta/v') }}
@@ -342,7 +350,7 @@ jobs:
           set -euo pipefail
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
+            $(printf '${{ steps.registry_image.outputs.name }}@sha256:%s ' *)
 
       # PID 1 must be an init that reaps adopted orphans. With node there, the
       # orphans agent runs leave behind are never wait()ed and pin as zombies
@@ -363,10 +371,10 @@ jobs:
           docker run --rm -i --pull always "$image" sh -s < scripts/assert-orphan-reaping.sh
 
   # Master cloud builds start independently in docker-cloud.yml. Tag builds
-  # and manual Docker dispatches call the same implementation, preserving the
-  # release tags and the canary promotion dependency below.
+  # call the same implementation, preserving release tags and canary promotion.
+  # A manual branch build needs only the self-hosted production image.
   build-and-push-cloud:
-    if: github.event_name != 'push' || github.ref != 'refs/heads/master'
+    if: startsWith(github.ref, 'refs/tags/')
     uses: ./.github/workflows/docker-cloud.yml
     permissions:
       contents: read
@@ -415,6 +423,7 @@ jobs:
           IMAGE: ghcr.io/${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          IMAGE="${IMAGE,,}"
           current="$(curl -fsS "https://registry.npmjs.org/-/package/@paperclipai%2Fdb/dist-tags" | jq -er .canary)"
           sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/$(printf 'canary/v%s' "$current" | jq -sRr @uri)" --jq .sha 2>/dev/null || true)"
           if [ -z "$sha" ]; then
