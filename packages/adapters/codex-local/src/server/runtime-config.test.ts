@@ -175,7 +175,7 @@ describe("prepareCodexRuntimeConfig", () => {
     await prepared.cleanup();
   });
 
-  it("expands {env:VAR} placeholders from the run env and process.env, leaving unresolvable ones intact", async () => {
+  it("expands only explicitly bound {env:VAR} placeholders, leaving ambient ones unresolved", async () => {
     const home = await makeCodexHome();
     process.env.PAPERCLIP_CODEX_TEST_PROCESS_KEY = "from-process-env";
     try {
@@ -201,7 +201,8 @@ describe("prepareCodexRuntimeConfig", () => {
 
       const content = await readConfigToml(home);
       expect(content).toContain('X-Run = "from-run-env"');
-      expect(content).toContain('X-Process = "from-process-env"');
+      expect(content).toContain('X-Process = "{env:PAPERCLIP_CODEX_TEST_PROCESS_KEY}"');
+      expect(content).not.toContain("from-process-env");
       expect(content).toContain('X-Missing = "{env:DEFINITELY_UNSET_VAR_XYZ}"');
 
       await prepared.cleanup();
@@ -210,13 +211,12 @@ describe("prepareCodexRuntimeConfig", () => {
     }
   });
 
-  it("reads PAPERCLIP_CODEX_PROVIDERS from process.env when absent from the run env", async () => {
+  it("does not inherit controller provider definitions when absent from the run env", async () => {
     const home = await makeCodexHome();
     process.env.PAPERCLIP_CODEX_PROVIDERS = JSON.stringify(BIFROST_PROVIDERS);
     try {
       const prepared = await prepareCodexRuntimeConfig({ env: {}, codexHome: home });
-      const content = await readConfigToml(home);
-      expect(content).toContain("[model_providers.bifrost]");
+      await expect(readConfigToml(home)).rejects.toMatchObject({ code: "ENOENT" });
       await prepared.cleanup();
     } finally {
       delete process.env.PAPERCLIP_CODEX_PROVIDERS;

@@ -29,6 +29,7 @@ import type {
 
 import {
   runChildProcess,
+  sanitizeInheritedPaperclipEnv,
   buildPaperclipEnv,
   buildRuntimeToolsEnv,
   renderTemplate,
@@ -488,7 +489,7 @@ export async function execute(
   // ── Build environment ──────────────────────────────────────────────────
   const userEnv = config.env as Record<string, string> | undefined;
   const env: Record<string, string> = {
-    ...(process.env as Record<string, string>),
+    ...sanitizeInheritedPaperclipEnv(process.env) as Record<string, string>,
     ...(userEnv && typeof userEnv === "object" ? userEnv : {}),
     ...buildPaperclipEnv(ctx.agent),
     ...buildRuntimeToolsEnv(ctx.runtimeTools),

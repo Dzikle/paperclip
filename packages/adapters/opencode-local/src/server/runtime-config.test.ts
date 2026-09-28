@@ -98,7 +98,7 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     await prepared.cleanup();
   });
 
-  it("reads PAPERCLIP_OPENCODE_PROVIDERS from process.env when absent from the run env", async () => {
+  it("does not inherit controller provider definitions when absent from the run env", async () => {
     const configHome = await makeConfigHome({ permission: { read: "allow" } });
     const providers = { bifrost: { npm: "@ai-sdk/openai-compatible", models: { "example/model-a": {} } } };
     process.env.PAPERCLIP_OPENCODE_PROVIDERS = JSON.stringify(providers);
@@ -111,14 +111,14 @@ describe("prepareOpenCodeRuntimeConfig", () => {
       const runtimeConfig = JSON.parse(
         await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8"),
       ) as Record<string, unknown>;
-      expect(runtimeConfig).toMatchObject({ provider: providers });
+      expect(runtimeConfig.provider).toBeUndefined();
       await prepared.cleanup();
     } finally {
       delete process.env.PAPERCLIP_OPENCODE_PROVIDERS;
     }
   });
 
-  it("expands {env:VAR} placeholders in custom providers using the run/process env (bakes the literal vk)", async () => {
+  it("expands {env:VAR} placeholders in custom providers using only the run env", async () => {
     const configHome = await makeConfigHome({ permission: { read: "allow" } });
     const providers = {
       bifrost: {
@@ -154,6 +154,28 @@ describe("prepareOpenCodeRuntimeConfig", () => {
     ) as { provider: { bifrost: { options: { apiKey: string } } } };
     expect(runtimeConfig.provider.bifrost.options.apiKey).toBe("{env:DEFINITELY_UNSET_VAR_XYZ}");
     await prepared.cleanup();
+  });
+
+  it("does not materialize a controller database credential through a provider placeholder", async () => {
+    const prior = process.env.DATABASE_URL;
+    process.env.DATABASE_URL = "controller-only-database-sentinel";
+    try {
+      const configHome = await makeConfigHome({ permission: "deny" });
+      const prepared = await prepareOpenCodeRuntimeConfig({
+        env: { XDG_CONFIG_HOME: configHome, PAPERCLIP_OPENCODE_PROVIDERS: JSON.stringify({
+          fixture: { options: { apiKey: "{env:DATABASE_URL}" }, models: { "fixture/model": {} } },
+        }) },
+        config: {},
+      });
+      cleanupPaths.add(prepared.env.XDG_CONFIG_HOME);
+      const content = await fs.readFile(path.join(prepared.env.XDG_CONFIG_HOME, "opencode", "opencode.json"), "utf8");
+      expect(content).not.toContain("controller-only-database-sentinel");
+      expect(content).toContain("{env:DATABASE_URL}");
+      await prepared.cleanup();
+    } finally {
+      if (prior === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = prior;
+    }
   });
 
   it("pins small_model from PAPERCLIP_OPENCODE_SMALL_MODEL", async () => {

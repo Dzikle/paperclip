@@ -1,8 +1,9 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execute } from "./execute.js";
+import { discoverOpenCodeModels } from "./models.js";
 
 // A real child process models OpenCode's PWD-first session directory selection.
 // No model, credentials, network, or process-spawn mock is involved.
@@ -20,6 +21,14 @@ describe.skipIf(process.platform === "win32")("OpenCode task directory binding",
 const fs = require("node:fs");
 const args = process.argv.slice(2);
 fs.appendFileSync(process.env.HOME + "/invocations.jsonl", JSON.stringify(args) + "\\n");
+if (args[0] === "models") {
+  fs.writeFileSync(process.env.AIF_TEST_ENV_RECEIPT, JSON.stringify({
+    forbidden: ["DATABASE_URL", "BETTER_AUTH_SECRET", "PRIVATE_BACKEND_CREDENTIAL"].filter(key => process.env[key] !== undefined),
+    assignedKey: process.env.OPENAI_API_KEY, proxy: process.env.HTTPS_PROXY, home: process.env.HOME
+  }));
+  console.log("fixture/no-inference");
+  process.exit(0);
+}
 if (args.includes("missing-session")) {
   console.error("Session not found");
   process.exit(1);
@@ -32,7 +41,20 @@ console.log(JSON.stringify({type: "text", sessionID: "fixture-session", part: {
   });
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it("model discovery cannot reintroduce controller secrets and retains explicit credentials/home", async () => {
+    for (const key of ["DATABASE_URL", "BETTER_AUTH_SECRET", "PRIVATE_BACKEND_CREDENTIAL"]) vi.stubEnv(key, "controller-only");
+    const receiptPath = path.join(root, "model-environment.json");
+    await discoverOpenCodeModels({ command, cwd: workspace, env: {
+      HOME: root, AIF_TEST_ENV_RECEIPT: receiptPath,
+      OPENAI_API_KEY: "assigned-provider", HTTPS_PROXY: "http://assigned-proxy:8080",
+    } });
+    expect(JSON.parse(await fs.readFile(receiptPath, "utf8"))).toEqual({
+      forbidden: [], assignedKey: "assigned-provider", proxy: "http://assigned-proxy:8080", home: root,
+    });
   });
 
   async function run(options: { extraArgs?: string[]; sessionId?: string; noWorkspace?: boolean } = {}) {

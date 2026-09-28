@@ -27,6 +27,7 @@ import {
   buildRuntimeToolsEnv,
   ensureAbsoluteDirectory,
   ensurePathInEnv,
+  sanitizeInheritedPaperclipEnv,
   joinPromptSections,
   materializePaperclipSkillCopy,
   parseObject,
@@ -324,7 +325,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // Explicit empty overrides clear inherited API keys in the child process.
     // Use the same precedence here when selecting its credential home.
     const isGrokSubscriptionMode = !hasNonEmptyEnvValue(
-      config.managedAiConnection ? env : { ...process.env, ...env },
+      config.managedAiConnection ? env : { ...sanitizeInheritedPaperclipEnv(process.env), ...env },
       "XAI_API_KEY",
     );
     if (isGrokSubscriptionMode) {
@@ -430,7 +431,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const runtimeExecutionTarget = overrideAdapterExecutionTargetRemoteCwd(executionTarget, effectiveExecutionCwd);
     const effectiveEnv = Object.fromEntries(
-      Object.entries({ ...process.env, ...env }).filter(
+      Object.entries({ ...sanitizeInheritedPaperclipEnv(process.env), ...env }).filter(
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     );

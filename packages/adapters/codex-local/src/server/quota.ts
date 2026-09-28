@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ProviderQuotaResult, QuotaWindow } from "@paperclipai/adapter-utils";
+import { sanitizeInheritedPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
 import {
   classifyCodexAuthRefreshFailure,
   type CodexAuthRefreshFailureClass,
@@ -471,7 +472,7 @@ class CodexRpcClient {
   private proc = spawn(
     "codex",
     ["-s", "read-only", "-a", "untrusted", "app-server"],
-    { stdio: ["pipe", "pipe", "pipe"], env: process.env },
+    { stdio: ["pipe", "pipe", "pipe"], env: { ...sanitizeInheritedPaperclipEnv(process.env), CODEX_HOME: codexHomeDir() } },
   );
 
   private nextId = 1;

@@ -337,10 +337,10 @@ export async function prepareCodexRuntimeConfig(input: {
   env: Record<string, string>;
   codexHome: string | null;
 }): Promise<PreparedCodexRuntimeConfig> {
-  const resolveEnv = (name: string): string | undefined => input.env[name] ?? process.env[name];
+  const resolveEnv = (name: string): string | undefined => input.env[name];
   const notes: string[] = [];
   const parsed = parseCodexProvidersConfig(
-    input.env.PAPERCLIP_CODEX_PROVIDERS ?? process.env.PAPERCLIP_CODEX_PROVIDERS,
+    input.env.PAPERCLIP_CODEX_PROVIDERS,
     resolveEnv,
     notes,
   );

@@ -292,8 +292,9 @@ describe("grok_local execute", () => {
       });
 
       // API-key billing: same token usage, plus the real dollar cost.
-      process.env.XAI_API_KEY = "test-key";
-      const apiResult = await execute(await makeCtx("run-api", await makeTempRoot()));
+      const apiCtx = await makeCtx("run-api", await makeTempRoot());
+      apiCtx.config.env = { XAI_API_KEY: "test-key" };
+      const apiResult = await execute(apiCtx);
       expect(apiResult).toMatchObject({
         usage: { inputTokens: 2384, outputTokens: 261, cachedInputTokens: 23040 },
         usageBasis: "per_run",
@@ -406,7 +407,7 @@ describe("grok_local execute", () => {
       },
     );
 
-    it.each(["inherited", "configured"])("preserves the %s host GROK_HOME fallback", async (source) => {
+    it.each(["inherited", "configured"])("only forwards explicitly configured GROK_HOME (%s)", async (source) => {
       const hostHome = await makeTempRoot();
       const ctx = await makeCtx("run-custom-host-home", await makeTempRoot());
       if (source === "inherited") process.env.GROK_HOME = hostHome;
@@ -415,10 +416,9 @@ describe("grok_local execute", () => {
 
       await execute(ctx);
 
-      // Command resolution receives the merged child environment, including
-      // inherited values that are absent from the explicit spawn overrides.
+      // Command resolution uses the same closed projection as the child.
       const commandCall = ensureCommandMock.mock.calls[0] as unknown as [unknown, unknown, unknown, Record<string, string>];
-      expect(commandCall[3].GROK_HOME).toBe(hostHome);
+      expect(commandCall[3].GROK_HOME).toBe(source === "configured" ? hostHome : undefined);
     });
 
     it("uses company login when an explicit empty API key overrides an inherited key", async () => {
@@ -674,7 +674,6 @@ describe("grok_local execute", () => {
     });
 
     it("passes no home asset and sets no GROK_HOME in a remote API-key run", async () => {
-      process.env.XAI_API_KEY = "test-key";
       mocks.state.isRemote = true;
       let seenEnv: Record<string, string> = {};
       runProcessMock.mockImplementation(async (_runId, _target, _command, _args, options) => {
@@ -682,7 +681,9 @@ describe("grok_local execute", () => {
         return makeSuccessfulRunResult();
       });
 
-      await execute(await makeCtx("run-remote-api-key", await makeTempRoot()));
+      const ctx = await makeCtx("run-remote-api-key", await makeTempRoot());
+      ctx.config.env = { XAI_API_KEY: "test-key" };
+      await execute(ctx);
 
       expect(prepareRuntimeMock).toHaveBeenCalledTimes(1);
       const { assets } = prepareRuntimeMock.mock.calls[0][0] as { assets?: unknown[] };

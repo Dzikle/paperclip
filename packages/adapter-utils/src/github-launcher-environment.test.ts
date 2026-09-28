@@ -176,14 +176,14 @@ describe("managed GitHub launcher environment", () => {
     expect(env.PAPERCLIP_GITHUB_LAUNCHER_DIR).toBeUndefined();
   });
 
-  it("preserves local host credential helpers and validates worktree metadata", async () => {
+  it("preserves explicitly bound GitHub tokens and validates worktree metadata", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-host-git-")); roots.push(root);
     vi.stubEnv("HOME", root);
     vi.stubEnv("GH_TOKEN", "legacy-token");
     await writeFile(path.join(root, ".gitconfig"), '[credential]\n  helper = store\n');
     await exec("git", ["init", path.join(root, "repo")]);
-    const env = await prepareGitHubExecutionEnvironment({ target: null, cwd: path.join(root, "repo"), env: {}, hostCredentials: true, networkAccess: true });
-    expect(env.GH_TOKEN).toBe("legacy-token");
+    const env = await prepareGitHubExecutionEnvironment({ target: null, cwd: path.join(root, "repo"), env: { GH_TOKEN: "assigned-token" }, hostCredentials: true, networkAccess: true });
+    expect(env.GH_TOKEN).toBe("assigned-token");
     expect(env.GIT_CONFIG_GLOBAL).toBeUndefined();
     expect(env.PAPERCLIP_GIT_METADATA_ROOTS).toContain("/repo/.git");
     const config = await exec("git", ["config", "credential.helper"], { cwd: root, env: { ...process.env, ...env } });
@@ -192,6 +192,17 @@ describe("managed GitHub launcher environment", () => {
     expect(isolated.GH_TOKEN).toBeUndefined();
     expect(isolated.PAPERCLIP_RUNNER_NETWORK_ACCESS).toBe("disabled");
     expect(isolated.PAPERCLIP_GITHUB_HOST_HOME).toBeUndefined();
+  });
+
+  it("does not promote ambient controller GitHub tokens into local run bindings", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-local-git-env-")); roots.push(root);
+    for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "PAPERCLIP_GIT_TOKEN"]) {
+      vi.stubEnv(key, "controller-only-token");
+    }
+    const env = await prepareGitHubExecutionEnvironment({ target: null, cwd: root, env: {}, hostCredentials: true, networkAccess: true });
+    for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "PAPERCLIP_GIT_TOKEN"]) {
+      expect(env[key]).toBeUndefined();
+    }
   });
 
   it.each(["nvm/current/bin", "usr/local/bin", "tools with 'quotes'/bin"])(
