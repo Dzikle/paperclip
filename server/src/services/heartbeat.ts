@@ -24892,6 +24892,9 @@ export function heartbeatService(
                 ...(cacheAdjustedCostUsd != null
                   ? { cacheAdjustedCostUsd }
                   : {}),
+                ...(status === "succeeded"
+                  ? {}
+                  : { usageCompleteness: "partial" }),
                 costStatus: resolveLedgerCostStatus({
                   costUsd: cacheAdjustedCostUsd,
                   inputTokens: normalizedUsage?.inputTokens ?? 0,
@@ -26097,9 +26100,8 @@ export function heartbeatService(
       } finally {
         controllerLease.stop();
         activeRunExecutions.delete(run.id);
-        // A failed owned Stop remains visible until this exact executor settles,
-        // including a graceful exit result arriving after the cancellation error.
-        // It is never retained beyond the active execution's cleanup.
+        // Keep an owned Stop visible through this executor's late result write.
+        processRunCancellationSettlements.delete(run.id);
         failedProcessRunCancellations.delete(run.id);
         executionControl.finish();
         if (adapterExecutionControls.get(run.id) === executionControl) {
@@ -29010,8 +29012,10 @@ export function heartbeatService(
         } finally {
           if (processCancellationSettlement) {
             if (
+              (processCancellationSettlement.failed ||
+                !activeRunExecutions.has(run.id)) &&
               processRunCancellationSettlements.get(run.id) ===
-              processCancellationSettlement
+                processCancellationSettlement
             ) {
               processRunCancellationSettlements.delete(run.id);
             }

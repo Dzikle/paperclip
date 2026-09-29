@@ -733,11 +733,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // A lost duplex control channel surfaces the typed `duplex_channel_lost`
         // code; every other result carries no code here.
         errorCode: attempt.proc.errorCode ?? null,
-        usage: {
-          inputTokens: attempt.parsed.usage.inputTokens,
-          outputTokens: attempt.parsed.usage.outputTokens,
-          cachedInputTokens: attempt.parsed.usage.cachedInputTokens,
-        },
+        ...(attempt.parsed.usage
+          ? { usage: attempt.parsed.usage, usageBasis: "per_run" as const }
+          : {}),
         sessionId: resolvedSessionId,
         sessionParams: resolvedSessionParams,
         sessionDisplayId: resolvedSessionId,

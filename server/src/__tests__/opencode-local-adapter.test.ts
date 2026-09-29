@@ -4,6 +4,38 @@ import { parseOpenCodeStdoutLine } from "@paperclipai/adapter-opencode-local/ui"
 import { printOpenCodeStreamEvent } from "@paperclipai/adapter-opencode-local/cli";
 
 describe("opencode_local parser", () => {
+  it("does not turn an interrupted stream without finished steps into reported zeros", () => {
+    const parsed = parseOpenCodeJsonl(JSON.stringify({ type: "step_start", sessionID: "ses_incomplete" }));
+    expect(parsed.usage).toBeNull();
+    expect(parsed.costUsd).toBeNull();
+  });
+
+  it("retains explicit zero usage and cost from a finished step", () => {
+    const parsed = parseOpenCodeJsonl(JSON.stringify({ type: "step_finish", part: {
+      cost: 0, tokens: { input: 0, output: 0, cache: { read: 0 } },
+    } }));
+    expect(parsed.usage).toEqual({ inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 });
+    expect(parsed.costUsd).toBe(0);
+  });
+
+  it("retains finished-step tokens without inventing an omitted price", () => {
+    const parsed = parseOpenCodeJsonl(JSON.stringify({ type: "step_finish", part: {
+      tokens: { input: 12, output: 4, cache: { read: 2 } },
+    } }));
+    expect(parsed.usage).toEqual({ inputTokens: 12, cachedInputTokens: 2, outputTokens: 4 });
+    expect(parsed.costUsd).toBeNull();
+  });
+
+  it.each([
+    { cost: undefined, tokens: undefined },
+    { cost: -1, tokens: { input: -1, output: 10, cache: { read: 2 } } },
+    { cost: "0", tokens: { input: "10", output: 5, cache: { read: 2 } } },
+  ])("keeps missing or invalid finished-step accounting unknown: %j", (part) => {
+    const parsed = parseOpenCodeJsonl(JSON.stringify({ type: "step_finish", part }));
+    expect(parsed.usage).toBeNull();
+    expect(parsed.costUsd).toBeNull();
+  });
+
   it("extracts session, summary, usage, cost, and terminal error message", () => {
     const stdout = [
       JSON.stringify({ type: "step_start", sessionID: "ses_123" }),

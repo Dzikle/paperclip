@@ -75,10 +75,33 @@ describe("OpenCode local skill injection", () => {
       onMeta: async (meta) => { prompt = String(meta.prompt ?? ""); },
     });
     expect(result.exitCode).toBe(0);
+    expect(result.usage).toBeUndefined();
+    expect(result.costUsd).toBeNull();
     expect(prompt).toContain(directive);
     expect(prompt).toContain(custom ? "Custom agent instruction." : "Continue your Paperclip conversation");
     expect(prompt).not.toContain("Execution contract:");
     expect(prompt).not.toContain("Create child issues");
+  });
+
+  it("reports finished-step usage as per-run rather than session-cumulative", async () => {
+    const commandPath = path.join(configHome, "fake-opencode");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    runProcessMock.mockReset();
+    runProcessMock.mockResolvedValue(probeResult({ stdout: JSON.stringify({
+      type: "step_finish", sessionID: "existing-session", part: {
+        cost: 0.12, tokens: { input: 20, output: 5, cache: { read: 3 } },
+      },
+    }) }));
+    const result = await execute({
+      runId: "next-run",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: "existing-session", sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: commandPath, cwd: configHome, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+      context: {}, onLog: async () => {},
+    });
+    expect(result.usage).toEqual({ inputTokens: 20, cachedInputTokens: 3, outputTokens: 5 });
+    expect(result.costUsd).toBe(0.12);
+    expect(result.usageBasis).toBe("per_run");
   });
 
   it("injects runtime skills into the configured child HOME", async () => {

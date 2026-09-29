@@ -7556,6 +7556,110 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     },
   );
 
+  it.each([0, 0.12])(
+    "retains delayed handoff usage after an owned Stop settles (cost %s)",
+    async (costUsd) => {
+      const actualProcess = await vi.importActual<
+        typeof import("../adapters/process/execute.js")
+      >("../adapters/process/execute.js");
+      let releaseResult!: () => void;
+      const resultGate = new Promise<void>((resolve) => { releaseResult = resolve; });
+      let reportReady!: () => void;
+      const ready = new Promise<void>((resolve) => { reportReady = resolve; });
+      mockAdapterExecute.mockImplementationOnce((async (input: unknown) => {
+        const context = input as Parameters<typeof actualProcess.execute>[0];
+        const result = await actualProcess.execute({
+          ...context,
+          onLog: async (stream, text) => {
+            await context.onLog(stream, text);
+            if (text.includes("handoff usage ready")) reportReady();
+          },
+        });
+        // Reproduce log/adapter cleanup finishing after the caller's Stop CAS.
+        await resultGate;
+        return {
+          ...result,
+          provider: "test",
+          model: "test-model",
+          usageBasis: "per_run",
+          usage: { inputTokens: 1200, cachedInputTokens: 200, outputTokens: 35 },
+          costUsd,
+        };
+      }) as typeof mockAdapterExecute);
+      const { companyId, runId, agentId, issueId } = await seedRunFixture({
+        adapterType: "opencode_local", runtimeMode: "legacy",
+        agentStatus: "idle", runStatus: "queued",
+      });
+      await db.update(agents).set({ adapterConfig: {
+        command: process.execPath,
+        args: ["-e", "console.log('handoff usage ready'); setInterval(() => {}, 1000)"],
+        graceSec: 1,
+      } }).where(eq(agents.id, agentId));
+      const heartbeat = heartbeatService(db);
+      await heartbeat.resumeQueuedRuns();
+      try {
+        await ready;
+        expect(runningProcesses.get(runId)?.child.pid).toBeTruthy();
+        const stopped = await heartbeat.cancelRun(runId, "Task handoff", {
+          errorCode: "issue_reassigned", resultJson: { reassignmentStopConfirmed: true },
+          suppressImmediateRecovery: true,
+        });
+        expect(stopped?.status).toBe("cancelled");
+        expect(stopped?.usageJson).toBeNull();
+        const successorAgentId = randomUUID();
+        const successorRunId = randomUUID();
+        await db.insert(agents).values({
+          id: successorAgentId, companyId, name: "Independent reviewer",
+          adapterType: "process", status: "paused",
+        });
+        await db.insert(heartbeatRuns).values({
+          id: successorRunId, companyId, agentId: successorAgentId,
+          status: "running", contextSnapshot: { issueId },
+        });
+        await db.update(issues).set({
+          assigneeAgentId: successorAgentId, executionRunId: successorRunId,
+          checkoutRunId: successorRunId,
+        }).where(eq(issues.id, issueId));
+        releaseResult();
+        await heartbeat.drainActiveRunExecutions();
+        const settled = await heartbeat.getRun(runId);
+        expect(settled).toMatchObject({
+          status: "cancelled", errorCode: "issue_reassigned",
+          finishedAt: stopped!.finishedAt,
+          usageJson: {
+            inputTokens: 1200, cachedInputTokens: 200, outputTokens: 35,
+            costUsd, costStatus: "reported", usageCompleteness: "partial",
+          },
+          resultJson: {
+            reassignmentStopConfirmed: true,
+            executionCancellation: { state: "acknowledged" },
+          },
+        });
+        expect(settled?.logBytes).toBeGreaterThan(0);
+        expect(settled?.logSha256).toMatch(/^[a-f0-9]{64}$/);
+        expect(await db.select({
+          assigneeAgentId: issues.assigneeAgentId,
+          executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId,
+        }).from(issues).where(eq(issues.id, issueId))).toEqual([{
+          assigneeAgentId: successorAgentId,
+          executionRunId: successorRunId, checkoutRunId: successorRunId,
+        }]);
+        await heartbeat.cancelRun(runId, "Repeated handoff Stop");
+        await heartbeat.drainActiveRunExecutions();
+        expect(await db.select({
+          inputTokens: costEvents.inputTokens, outputTokens: costEvents.outputTokens,
+          costCents: costEvents.costCents,
+        }).from(costEvents).where(eq(costEvents.heartbeatRunId, runId))).toEqual([
+          { inputTokens: 1200, outputTokens: 35, costCents: costUsd === 0 ? 0 : 12 },
+        ]);
+        expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+      } finally {
+        releaseResult();
+        await heartbeat.drainActiveRunExecutions();
+      }
+    },
+  );
+
   it.each([
     {
       mode: "clean exit",

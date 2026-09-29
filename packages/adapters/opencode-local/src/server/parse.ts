@@ -1,4 +1,10 @@
-import { asNumber, asString, parseJson, parseObject } from "@paperclipai/adapter-utils/server-utils";
+import { asString, parseJson, parseObject } from "@paperclipai/adapter-utils/server-utils";
+
+function tokenCount(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : null;
+}
 
 function errorText(value: unknown): string {
   if (typeof value === "string") return value;
@@ -30,6 +36,9 @@ export function parseOpenCodeJsonl(stdout: string) {
     outputTokens: 0,
   };
   let costUsd = 0;
+  let finishedSteps = 0;
+  let invalidUsage = false;
+  let invalidCost = false;
 
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -54,10 +63,24 @@ export function parseOpenCodeJsonl(stdout: string) {
       const part = parseObject(event.part);
       const tokens = parseObject(part.tokens);
       const cache = parseObject(tokens.cache);
-      usage.inputTokens += asNumber(tokens.input, 0);
-      usage.cachedInputTokens += asNumber(cache.read, 0);
-      usage.outputTokens += asNumber(tokens.output, 0) + asNumber(tokens.reasoning, 0);
-      costUsd += asNumber(part.cost, 0);
+      const input = tokenCount(tokens.input);
+      const cached = tokenCount(cache.read);
+      const output = tokenCount(tokens.output);
+      const reasoning = tokens.reasoning === undefined ? 0 : tokenCount(tokens.reasoning);
+      const cost = part.cost;
+      if (input === null || cached === null || output === null || reasoning === null) {
+        invalidUsage = true;
+      } else {
+        usage.inputTokens += input;
+        usage.cachedInputTokens += cached;
+        usage.outputTokens += output + reasoning;
+      }
+      if (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0) {
+        invalidCost = true;
+      } else {
+        costUsd += cost;
+      }
+      finishedSteps++;
       continue;
     }
 
@@ -81,8 +104,8 @@ export function parseOpenCodeJsonl(stdout: string) {
   return {
     sessionId,
     summary: messages.join("\n\n").trim(),
-    usage,
-    costUsd,
+    usage: finishedSteps > 0 && !invalidUsage ? usage : null,
+    costUsd: finishedSteps > 0 && !invalidCost ? costUsd : null,
     errorMessage: errors.length > 0 ? errors.join("\n") : null,
     toolErrors,
   };
