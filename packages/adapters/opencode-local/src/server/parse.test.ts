@@ -69,6 +69,19 @@ describe("parseOpenCodeJsonl", () => {
     expect(parsed.toolErrors).toEqual(["File not found: e2b-adapter-result.txt"]);
   });
 
+  it("does not certify usage when a nonempty stream line is malformed", () => {
+    const stdout = [
+      JSON.stringify({ type: "step_finish", sessionID: "s1", part: {
+        cost: 0.02, tokens: { input: 10, output: 4, cache: { read: 1 } },
+      } }),
+      '{"type":"step_finish","part":',
+    ].join("\n");
+    const parsed = parseOpenCodeJsonl(stdout);
+    expect(parsed.sessionId).toBe("s1");
+    expect(parsed.usage).toBeNull();
+    expect(parsed.costUsd).toBeNull();
+  });
+
   it("detects unknown session errors", () => {
     expect(isOpenCodeUnknownSessionError("Session not found: s_123", "")).toBe(true);
     expect(isOpenCodeUnknownSessionError("", "unknown session id")).toBe(true);

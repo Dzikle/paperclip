@@ -39,13 +39,17 @@ export function parseOpenCodeJsonl(stdout: string) {
   let finishedSteps = 0;
   let invalidUsage = false;
   let invalidCost = false;
+  let invalidStream = false;
 
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line) continue;
 
     const event = parseJson(line);
-    if (!event) continue;
+    if (!event) {
+      invalidStream = true;
+      continue;
+    }
 
     const currentSessionId = asString(event.sessionID, "").trim();
     if (currentSessionId) sessionId = currentSessionId;
@@ -104,8 +108,8 @@ export function parseOpenCodeJsonl(stdout: string) {
   return {
     sessionId,
     summary: messages.join("\n\n").trim(),
-    usage: finishedSteps > 0 && !invalidUsage ? usage : null,
-    costUsd: finishedSteps > 0 && !invalidCost ? costUsd : null,
+    usage: finishedSteps > 0 && !invalidUsage && !invalidStream ? usage : null,
+    costUsd: finishedSteps > 0 && !invalidCost && !invalidStream ? costUsd : null,
     errorMessage: errors.length > 0 ? errors.join("\n") : null,
     toolErrors,
   };

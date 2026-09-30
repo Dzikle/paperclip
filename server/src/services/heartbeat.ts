@@ -1259,6 +1259,9 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
 // Routes and the scheduler construct separate heartbeatService instances, but
 // they must agree on in-process adapter executions when reaping stale runs.
 const activeRunExecutions = new Set<string>();
+// A legacy child may close before adapter cleanup returns its final result.
+// Keep its same-run executor ownership visible to Stop until that result settles.
+const legacySpawnedRunExecutions = new Set<string>();
 // A legacy process adapter's signal exit can race the operator cancellation CAS while
 // its owned process group is still being joined. Keep that exit from becoming
 // a successful result (or a competing failure) before Stop settles. This is an
@@ -24431,6 +24434,7 @@ export function heartbeatService(
                       }
                     },
                     onSpawn: async (meta) => {
+                      legacySpawnedRunExecutions.add(run.id);
                       markDispatchStarted();
                       await persistRunProcessMetadata(run.id, {
                         pid: meta.pid,
@@ -26100,6 +26104,7 @@ export function heartbeatService(
       } finally {
         controllerLease.stop();
         activeRunExecutions.delete(run.id);
+        legacySpawnedRunExecutions.delete(run.id);
         // Keep an owned Stop visible through this executor's late result write.
         processRunCancellationSettlements.delete(run.id);
         failedProcessRunCancellations.delete(run.id);
@@ -28846,7 +28851,7 @@ export function heartbeatService(
       const processCancellationSettlement =
         run.runtimeMode !== "native" &&
         !control &&
-        running
+        (running || legacySpawnedRunExecutions.has(run.id))
           ? {
               settled: new Promise<void>((resolve) => {
                 releaseProcessCancellation = resolve;

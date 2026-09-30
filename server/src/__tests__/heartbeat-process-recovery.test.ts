@@ -7556,9 +7556,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     },
   );
 
-  it.each([0, 0.12])(
-    "retains delayed handoff usage after an owned Stop settles (cost %s)",
-    async (costUsd) => {
+  it.each([
+    { costUsd: 0, exited: false },
+    { costUsd: 0.12, exited: false },
+    { costUsd: 0.12, exited: true },
+  ])(
+    "retains delayed handoff usage after an owned Stop settles (cost $costUsd, exited $exited)",
+    async ({ costUsd, exited }) => {
       const actualProcess = await vi.importActual<
         typeof import("../adapters/process/execute.js")
       >("../adapters/process/execute.js");
@@ -7592,14 +7596,21 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       });
       await db.update(agents).set({ adapterConfig: {
         command: process.execPath,
-        args: ["-e", "console.log('handoff usage ready'); setInterval(() => {}, 1000)"],
+        args: ["-e", exited
+          ? "console.log('handoff usage ready')"
+          : "console.log('handoff usage ready'); setInterval(() => {}, 1000)"],
         graceSec: 1,
       } }).where(eq(agents.id, agentId));
       const heartbeat = heartbeatService(db);
       await heartbeat.resumeQueuedRuns();
       try {
         await ready;
-        expect(runningProcesses.get(runId)?.child.pid).toBeTruthy();
+        if (exited) {
+          expect(await waitForValue(async () => runningProcesses.has(runId) ? null : true)).toBe(true);
+          expect((await heartbeat.getRun(runId))?.status).toBe("running");
+        } else {
+          expect(runningProcesses.get(runId)?.child.pid).toBeTruthy();
+        }
         const stopped = await heartbeat.cancelRun(runId, "Task handoff", {
           errorCode: "issue_reassigned", resultJson: { reassignmentStopConfirmed: true },
           suppressImmediateRecovery: true,
@@ -7632,7 +7643,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           },
           resultJson: {
             reassignmentStopConfirmed: true,
-            executionCancellation: { state: "acknowledged" },
+            ...(!exited ? { executionCancellation: { state: "acknowledged" } } : {}),
           },
         });
         expect(settled?.logBytes).toBeGreaterThan(0);
