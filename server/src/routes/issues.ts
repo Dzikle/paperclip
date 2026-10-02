@@ -2,6 +2,7 @@ import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractio
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { issueHandoffStillOwned, LEGACY_RECOVERY_CAUSE, recordCommittedIssueHandoff } from "../services/legacy-execution-recovery.js";
 import { extractIssueReferenceIdentifiers, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -4400,6 +4401,9 @@ export function issueRoutes(
           )
         : input.activeRecoveryAction;
     if (!activeRecoveryAction) return null;
+
+    // Task edits are not evidence that interrupted provider actions are settled.
+    if (activeRecoveryAction.cause === LEGACY_RECOVERY_CAUSE) return activeRecoveryAction;
 
     const resolutionNote = await classifySourceRecoveryRevalidation(input);
     if (!resolutionNote) return activeRecoveryAction;
@@ -13013,6 +13017,7 @@ export function issueRoutes(
         return;
       }
       let interruptedRunId: string | null = null;
+      let authorHandoff: { runId: string; agentId: string } | null = null;
       const closedExecutionWorkspace =
         await getClosedIssueExecutionWorkspace(existing);
       const isAgentWorkUpdate =
@@ -13412,6 +13417,7 @@ export function issueRoutes(
             {
               errorCode: "issue_reassigned",
               resultJson: { reassignmentStopConfirmed: true },
+              suppressImmediateRecovery: true,
               eventMessage: "run cancelled before issue reassignment",
               eventPayload: { issueId: existing.id },
             },
@@ -13426,6 +13432,10 @@ export function issueRoutes(
             );
           }
           interruptedRunId = cancelled.id;
+          if (transition.workflowControlledAssignment && actor.actorType === "agent" &&
+              actor.runId === cancelled.id && actor.agentId === cancelled.agentId) {
+            authorHandoff = { runId: cancelled.id, agentId: cancelled.agentId };
+          }
         }
       }
 
@@ -13647,6 +13657,7 @@ export function issueRoutes(
         ? await sourceTrustForActorWrite(existing, actor)
         : undefined;
       const shouldUseTransactionalIssueUpdate =
+        Boolean(authorHandoff) ||
         Boolean(commentAttachmentIds?.length) ||
         Boolean(decision) ||
         shouldRelayStop ||
@@ -13655,6 +13666,12 @@ export function issueRoutes(
       try {
         if (shouldUseTransactionalIssueUpdate) {
           issue = await db.transaction(async (tx) => {
+            if (authorHandoff) {
+              const lockedExisting = await svc.getByIdForUpdate(id, tx);
+              if (!lockedExisting || !issueHandoffStillOwned(existing, lockedExisting, authorHandoff.runId)) {
+                throw conflict("The task ownership or workflow changed while its author run was stopping");
+              }
+            }
             if (
               reviewPolicySensitiveMutationRequested &&
               !(await assertLockedReviewPolicyAllowsMutation(tx))
@@ -13697,6 +13714,12 @@ export function issueRoutes(
                 outcome: decision.outcome,
                 body: decision.body,
                 createdByRunId: actor.runId ?? null,
+              });
+            }
+
+            if (authorHandoff) {
+              await recordCommittedIssueHandoff(tx as unknown as Db, {
+                ...authorHandoff, companyId: updated.companyId, issueId: updated.id,
               });
             }
 

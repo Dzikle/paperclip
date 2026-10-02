@@ -1,25 +1,56 @@
 import { normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
 import { hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
+import { hasAcknowledgedNativeReassignmentStopIntent } from "./acknowledged-native-stop.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 
+type HandoffIssue = Pick<typeof issues.$inferSelect,
+  "id" | "companyId" | "status" | "statusVersion" | "assigneeAgentId" | "assigneeUserId" |
+  "executionState" | "executionPolicy" | "executionRunId" | "checkoutRunId">;
+
+export function issueHandoffStillOwned(expected: HandoffIssue, current: HandoffIssue, runId: string) {
+  return current.id === expected.id && current.companyId === expected.companyId &&
+    current.status === expected.status && current.statusVersion === expected.statusVersion &&
+    current.assigneeAgentId === expected.assigneeAgentId && current.assigneeUserId === expected.assigneeUserId &&
+    isDeepStrictEqual(current.executionState, expected.executionState) &&
+    isDeepStrictEqual(current.executionPolicy, expected.executionPolicy) &&
+    (!current.executionRunId || current.executionRunId === runId) &&
+    (!current.checkoutRunId || current.checkoutRunId === runId);
+}
+
+/** Late provider accounting must not overwrite a newer control-plane receipt. */
+export function preserveIssueHandoff(result: Record<string, unknown> | null | undefined) {
+  return sql`${JSON.stringify(result ?? {})}::jsonb || case
+    when ${heartbeatRuns.resultJson} ? 'issueHandoff'
+    then jsonb_build_object('issueHandoff', ${heartbeatRuns.resultJson}->'issueHandoff')
+    else '{}'::jsonb end`;
+}
+
 /** Error families describe availability, not whether earlier actions happened. */
 export function legacyExecutionNeedsReconciliation(
-  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot">>,
+  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "id" | "companyId" | "agentId" | "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot">>,
 ): boolean {
   if (
     run.runtimeMode === "native" ||
     !["failed", "timed_out", "interrupted", "cancelled"].includes(run.status)
   )
     return false;
+  const handoff = run.resultJson?.issueHandoff as Record<string, unknown> | undefined;
+  if (run.status === "cancelled" && run.errorCode === "issue_reassigned" &&
+      run.resultJson?.reassignmentStopConfirmed === true && run.id && run.companyId && run.agentId &&
+      (run.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state === "acknowledged" &&
+      handoff?.runId === run.id && handoff.companyId === run.companyId &&
+      handoff.agentId === run.agentId && typeof handoff.issueId === "string" &&
+      handoff.issueId === run.contextSnapshot?.issueId) return false;
   // A fresh conversation turn lets the agent decide what remains. The retry
   // scheduler, not an action-outcome hold, owns the automatic attempt limit.
   if (hasConversationContinuationPolicy(run.resultJson)) return false;
@@ -46,6 +77,49 @@ export function legacyExecutionNeedsReconciliation(
   return !(
     evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false
   );
+}
+
+/** Called in the task-update transaction, only for its authenticated author run. */
+export async function recordCommittedIssueHandoff(db: Db, input: {
+  companyId: string; issueId: string; agentId: string; runId: string;
+}) {
+  const now = new Date();
+  const handoff = { ...input, committedAt: now.toISOString() };
+  const [recorded] = await db.update(heartbeatRuns).set({
+    resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ||
+      ${JSON.stringify({ issueHandoff: handoff })}::jsonb`,
+    updatedAt: now,
+  }).where(and(
+    eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId),
+    eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.status, "cancelled"),
+    eq(heartbeatRuns.errorCode, "issue_reassigned"),
+    sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`,
+    sql`${heartbeatRuns.resultJson}->'reassignmentStopConfirmed' = 'true'::jsonb`,
+  )).returning();
+  if (!recorded) throw new Error("The task handoff has no confirmed stopped author run");
+  if ((recorded.runtimeMode === "native" && !hasAcknowledgedNativeReassignmentStopIntent(recorded)) ||
+      (recorded.runtimeMode !== "native" &&
+        (recorded.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state !== "acknowledged")) {
+    throw new Error("The task handoff has no provider stop acknowledgement");
+  }
+  // Stop terminalizes before assignment commits. Retire only that run's hold;
+  // preserve unrelated failures and the original cancellation evidence.
+  await db.update(issueRecoveryActions).set({
+    status: "resolved", outcome: "completed", resolvedAt: now, updatedAt: now,
+    resolutionNote: "Confirmed author-run stop and task handoff committed together.",
+    evidence: sql`coalesce(${issueRecoveryActions.evidence}, '{}'::jsonb) ||
+      ${JSON.stringify({ issueHandoff: handoff })}::jsonb ||
+      jsonb_build_object('automaticRecovery',
+        coalesce(${issueRecoveryActions.evidence}->'automaticRecovery', '{}'::jsonb) ||
+        '{"replay":"not_required"}'::jsonb)`,
+  }).where(and(
+    eq(issueRecoveryActions.companyId, input.companyId),
+    eq(issueRecoveryActions.sourceIssueId, input.issueId),
+    eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE),
+    eq(issueRecoveryActions.fingerprint, `legacy-execution:${input.runId}`),
+    sql`${issueRecoveryActions.evidence}->>'runId' = ${input.runId}`,
+    inArray(issueRecoveryActions.status, ["active", "escalated", "resolved"]),
+  ));
 }
 
 /** Persist the failed legacy run, owned lock release and operator decision together. */

@@ -21,6 +21,7 @@ import { claimQueuedNativeReviewRun } from "./native-runtime/native-review-dispa
 import { buildNativeReviewRequest } from "./native-runtime/native-review-prompt.js";
 import {
   legacyExecutionNeedsReconciliation,
+  preserveIssueHandoff,
   terminalizeLegacyExecution,
 } from "./legacy-execution-recovery.js";
 import {
@@ -24975,6 +24976,7 @@ export function heartbeatService(
               .update(heartbeatRuns)
               .set({
                 ...finalRunPatch,
+                resultJson: preserveIssueHandoff(finalRunPatch.resultJson),
                 finishedAt:
                   persistedRunWrite.run.finishedAt ?? finalRunPatch.finishedAt,
                 updatedAt: new Date(),
@@ -25230,6 +25232,7 @@ export function heartbeatService(
           const conversationSettled = await settleConversationTurn(db, livenessRun);
           await releaseIssueExecutionAndPromote(livenessRun, {
             suppressImmediateRecovery: conversationSettled ||
+              (livenessRun.status === "cancelled" && livenessRun.errorCode === "issue_reassigned") ||
               readNonEmptyString(
                 parseObject(livenessRun.contextSnapshot).goalControlRequestId,
               ) !== null ||

@@ -135,7 +135,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issue-recovery-actions-");
     db = createDb(tempDb.connectionString);
-  }, 30_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(issueRecoveryActions);
@@ -2132,6 +2132,23 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       resolutionNote: "Try the source issue again.",
     });
     expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+  });
+
+  it("retains an interrupted execution hold after board reassignment and ordinary status edits", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId, sourceIssueId, kind: "active_run_watchdog", ownerType: "board",
+      cause: "legacy_execution_requires_reconciliation", fingerprint: "legacy-execution:crashed-run",
+      evidence: { runId: "crashed-run", originalFailureCode: "process_lost" },
+      nextAction: "Reconcile unknown provider actions.", wakePolicy: null,
+    });
+    await request(createApp()).patch(`/api/issues/${sourceIssueId}`)
+      .send({ assigneeAgentId: managerId, status: "todo" }).expect(200);
+    await request(createApp()).get(`/api/issues/${sourceIssueId}`).expect(200);
+    expect(await recoveryActionSvc.getActiveForIssue(companyId, sourceIssueId)).toMatchObject({
+      id: action.id, cause: "legacy_execution_requires_reconciliation", status: "active",
+    });
   });
 
   it("marks a recovery action stale when a blocked source issue is manually moved to todo", async () => {
