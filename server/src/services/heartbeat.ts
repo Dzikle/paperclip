@@ -25167,10 +25167,10 @@ export function heartbeatService(
             await db
               .update(heartbeatRuns)
               .set({
-                resultJson: {
+                resultJson: preserveIssueHandoff({
                   ...persistedResultJson,
                   presentationDecision,
-                },
+                }),
                 updatedAt: new Date(),
               })
               .where(eq(heartbeatRuns.id, livenessRun.id));

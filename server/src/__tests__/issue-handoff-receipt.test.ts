@@ -92,14 +92,15 @@ describeDatabase("committed issue handoff receipts", () => {
     expect(current.action.status).toBe("active");
   });
 
-  it("preserves a concurrently committed receipt during late provider accounting", async () => {
+  it.each(["accounting", "presentation"])("preserves a concurrently committed receipt during late %s persistence", async (writer) => {
     const input = await seed();
     const stale = (await read(input)).run.resultJson;
     await db.transaction(tx => recordCommittedIssueHandoff(tx as unknown as typeof db, input));
     const receipt = (await read(input)).run.resultJson?.issueHandoff;
-    await db.update(heartbeatRuns).set({ resultJson: preserveIssueHandoff({ ...stale, usageCompleteness: "partial" }) }).where(eq(heartbeatRuns.id, input.runId));
+    const metadata = writer === "accounting" ? { usageCompleteness: "partial" } : { presentationDecision: { commentAction: "none" } };
+    await db.update(heartbeatRuns).set({ resultJson: preserveIssueHandoff({ ...stale, ...metadata }) }).where(eq(heartbeatRuns.id, input.runId));
     const current = await read(input);
     expect(current.run.resultJson?.issueHandoff).toEqual(receipt);
-    expect(current.run.resultJson?.usageCompleteness).toBe("partial");
+    expect(current.run.resultJson).toMatchObject(metadata);
   });
 });
