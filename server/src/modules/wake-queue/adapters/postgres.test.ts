@@ -20,6 +20,7 @@ import {
 } from "../../../__tests__/helpers/embedded-postgres.js";
 import {
   createAdmissionTransactionScope,
+  createWakeAdmissionReader,
   createPostgresWakeQueueAdapter,
   createWakeAdmissionWriter,
 } from "./postgres.js";
@@ -54,7 +55,7 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-wake-queue-postgres-adapter-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 120_000);
 
   afterEach(async () => {
     await db.delete(activityLog);
@@ -170,6 +171,26 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     });
     return id;
   }
+
+  it("does not promote or coalesce a committed handoff through the ordinary deferred queue", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent({ companyId });
+    const issueId = await seedIssue({ companyId, assigneeAgentId: agentId });
+    const runId = await seedRun({ companyId, agentId, status: "succeeded", contextSnapshot: { issueId } });
+    const wakeId = await seedDeferredWake({ companyId, agentId, issueId, payload: { issueHandoffSourceRunId: runId } });
+    const adapter = createPostgresWakeQueueAdapter(db, stubDeps);
+    await adapter.withIssueExecutionLock({ companyId, runId, now: new Date() }, async (_locked, ports) => {
+      expect(await ports.transaction.findNextDeferredWake({ companyId, issueId })).toBeNull();
+      return { outcome: { kind: "released" as const }, postCommitEffects: [] };
+    });
+    await db.transaction(async tx => {
+      expect(await createWakeAdmissionReader().findExistingDeferredWake(
+        createAdmissionTransactionScope(companyId, tx as unknown as Db), { companyId, agentId, issueId },
+      )).toBeNull();
+    });
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId)))[0])
+      .toMatchObject({ status: "deferred_issue_execution", runId: null });
+  });
 
   it.each([
     "completed", "multiple_comments", "repeated_reference", "parent_reference", "mixed_issue_references", "mixed_foreign_references", "mixed_unknown_references", "no_comments", "missing_comment",

@@ -13718,8 +13718,15 @@ export function issueRoutes(
             }
 
             if (authorHandoff) {
+              const nextWakeup = deferWakeForGoal === true ? null : buildExecutionStageWakeup({
+                issueId: updated.id, previousState: parseIssueExecutionState(existing.executionState),
+                nextState: parseIssueExecutionState(updated.executionState), interruptedRunId: authorHandoff.runId,
+                requestedByActorType: actor.actorType, requestedByActorId: actor.actorId,
+              });
               await recordCommittedIssueHandoff(tx as unknown as Db, {
                 ...authorHandoff, companyId: updated.companyId, issueId: updated.id,
+                nextWakeup: nextWakeup ? { ...nextWakeup, statusVersion: updated.statusVersion,
+                  executionState: updated.executionState as Record<string, unknown> | null } : null,
               });
             }
 
@@ -14495,6 +14502,15 @@ export function issueRoutes(
 
       // Merge all wakeups from this update into one enqueue per agent to avoid duplicate runs.
       void (async () => {
+        const durableStageAgentId = authorHandoff && executionStageWakeup && deferWakeForGoal !== true
+          ? executionStageWakeup.agentId : null;
+        if (durableStageAgentId && authorHandoff) {
+          // The transaction's existing wake receipt survives cleanup delay and
+          // controller loss. Never also emit an in-memory stage wake.
+          await heartbeat.resumeCommittedIssueHandoffs({ runId: authorHandoff.runId }).catch(err => {
+            logger.warn({ err, issueId: issue.id }, "committed task handoff will retry through the durable queue");
+          });
+        }
         type WakeupRequest = NonNullable<
           Parameters<typeof heartbeat.wakeup>[1]
         >;
@@ -14513,6 +14529,7 @@ export function issueRoutes(
             typeof wakeup.payload.issueId === "string"
               ? wakeup.payload.issueId
               : issue.id;
+          if (agentId === durableStageAgentId && wakeIssueId === issue.id) return;
           wakeups.set(`${agentId}:${wakeIssueId}`, { agentId, wakeup });
         };
         const addDependencyResolvedWakeup = async (input: {

@@ -1,5 +1,5 @@
 import { expect, it } from "vitest";
-import { issueHandoffStillOwned, legacyExecutionNeedsReconciliation } from "./legacy-execution-recovery.js";
+import { hasCommittedIssueHandoff, issueHandoffStillOwned, legacyExecutionNeedsReconciliation } from "./legacy-execution-recovery.js";
 
 const stopped = {
   runtimeMode: "legacy", status: "cancelled", errorCode: "cancelled",
@@ -43,14 +43,32 @@ it.each([
 });
 
 it("does not replay or reconcile a confirmed run-authored handoff committed with the issue", () => {
+  expect(hasCommittedIssueHandoff(committedHandoff)).toBe(true);
   expect(legacyExecutionNeedsReconciliation(committedHandoff)).toBe(false);
   expect(legacyExecutionNeedsReconciliation({ ...committedHandoff, scheduledRetryAttempt: 8 })).toBe(false);
+});
+
+it("requires the native runtime's audited acknowledgement for a committed native handoff", () => {
+  const native = { ...committedHandoff, runtimeMode: "native", nativeIssueId: "issue-1" };
+  expect(hasCommittedIssueHandoff(native)).toBe(false);
+  const acknowledged = { ...native, resultJson: { ...native.resultJson,
+    reassignmentStopRequested: true,
+    nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId: "run-1", companyId: "company-1",
+      issueId: "issue-1", scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged",
+      dispatched: true, intentAuditId: "intent", acknowledgementAuditId: "ack" },
+  } };
+  expect(hasCommittedIssueHandoff(acknowledged)).toBe(true);
+  expect(hasCommittedIssueHandoff({ ...acknowledged, nativeIssueId: "another-issue" })).toBe(false);
 });
 
 it.each([
   { runId: "another-run" }, { companyId: "another-company" },
   { agentId: "another-agent" }, { issueId: "another-issue" },
 ])("keeps mismatched handoff evidence held: %j", (mismatch) => {
+  expect(hasCommittedIssueHandoff({ ...committedHandoff, resultJson: {
+    ...committedHandoff.resultJson,
+    issueHandoff: { ...committedHandoff.resultJson.issueHandoff, ...mismatch },
+  } })).toBe(false);
   expect(legacyExecutionNeedsReconciliation({ ...committedHandoff, resultJson: {
     ...committedHandoff.resultJson,
     issueHandoff: { ...committedHandoff.resultJson.issueHandoff, ...mismatch },

@@ -1,4 +1,5 @@
 import { publicChatTaskUrl } from "./chat-task-url.js";
+import { isDeepStrictEqual } from "node:util";
 import { toolActionDeliveryService } from "./tool-action-delivery.js";
 import { githubBotConnectionIdsForRun } from "./chat-github-tools.js";
 import { readQueuedInteractionResponse } from "./queued-interaction-response.js";
@@ -21,6 +22,7 @@ import { claimQueuedNativeReviewRun } from "./native-runtime/native-review-dispa
 import { buildNativeReviewRequest } from "./native-runtime/native-review-prompt.js";
 import {
   legacyExecutionNeedsReconciliation,
+  hasCommittedIssueHandoff,
   preserveIssueHandoff,
   terminalizeLegacyExecution,
 } from "./legacy-execution-recovery.js";
@@ -3643,6 +3645,8 @@ interface WakeupOptions {
   queuedCommentInterruptId?: string;
   /** Internal delivery of an existing undelivered user comment. */
   queuedCommentRequestId?: string;
+  /** Internal delivery of the wake committed with a stopped author handoff. */
+  handoffWakeupRequestId?: string;
   /** Exact failed run selected by an authenticated board Retry request. */
   failedRunId?: string | null;
   durableChatRequest?: DurableChatWakeupRequest;
@@ -10467,6 +10471,7 @@ export function heartbeatService(
         eq(issueRecoveryActions.companyId, issues.companyId), eq(issueRecoveryActions.sourceIssueId, issues.id),
         executionBlockerPredicate(),
       ))), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        sql`${agentWakeupRequests.payload}->>'issueHandoffSourceRunId' is null`,
         eq(agentWakeupRequests.requestedByActorType, "user"),
         sql`${agentWakeupRequests.payload}->'executionWait' is not null`,
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
@@ -13611,6 +13616,10 @@ export function heartbeatService(
   async function handleIssueReviewPathDisposition(
     run: typeof heartbeatRuns.$inferSelect,
   ) {
+    // Reassignment owns the replacement wake. This snapshot can predate its
+    // committed receipt; source teardown must not diagnose a lost review path.
+    if (hasCommittedIssueHandoff(run) || (run.status === "cancelled" &&
+        run.errorCode === "issue_reassigned" && run.resultJson?.reassignmentStopConfirmed === true)) return;
     const contextSnapshot = parseObject(run.contextSnapshot);
     if (readNonEmptyString(contextSnapshot.goalControlRequestId)) return;
     const issueId =
@@ -19332,8 +19341,33 @@ export function heartbeatService(
     return { reaped: reaped.length, runIds: reaped };
   }
 
+  async function resumeCommittedIssueHandoffs(input: { runId?: string } = {}) {
+    if ((await getSchedulingSuppression()).suppressed) return;
+    const pending = await db.select({ wake: agentWakeupRequests }).from(agentWakeupRequests)
+      .innerJoin(companies, and(eq(companies.id, agentWakeupRequests.companyId), eq(companies.status, "active")))
+      .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        sql`${agentWakeupRequests.payload}->>'issueHandoffSourceRunId' is not null`,
+        input.runId ? sql`${agentWakeupRequests.payload}->>'issueHandoffSourceRunId' = ${input.runId}`
+          : lte(agentWakeupRequests.updatedAt, new Date(Date.now() - 30_000))))
+      .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
+    for (const { wake } of pending) {
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+        eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      ));
+      await enqueueWakeup(wake.agentId, {
+        handoffWakeupRequestId: wake.id, allowRunCoalescing: false,
+        source: wake.source as WakeupOptions["source"], triggerDetail: wake.triggerDetail as WakeupOptions["triggerDetail"],
+        reason: wake.reason, payload: parseObject(wake.payload),
+        contextSnapshot: parseObject(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]),
+        requestedByActorType: wake.requestedByActorType as WakeupOptions["requestedByActorType"],
+        requestedByActorId: wake.requestedByActorId, idempotencyKey: wake.idempotencyKey,
+      }).catch(err => logger.warn({ err, queueId: wake.id }, "task handoff is waiting for execution admission"));
+    }
+  }
+
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
+    await resumeCommittedIssueHandoffs();
     await resumeExecutionWaitComments();
     const cutoff = await getWorktreeExecutionCutoff();
     const pendingInterrupts = await db.select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId })
@@ -19341,6 +19375,7 @@ export function heartbeatService(
       .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
         eq(companies.status, "active"),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is not null`,
+        sql`${agentWakeupRequests.payload}->>'issueHandoffSourceRunId' is null`,
         lte(agentWakeupRequests.updatedAt, new Date(Date.now() - 30_000)),
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
@@ -19363,6 +19398,7 @@ export function heartbeatService(
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
       .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
         isNull(issues.executionRunId),
+        sql`${agentWakeupRequests.payload}->>'issueHandoffSourceRunId' is null`,
         or(and(
           sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
           sql`${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
@@ -19409,6 +19445,7 @@ export function heartbeatService(
         eq(agentWakeupRequests.status, "deferred_issue_execution"),
         eq(heartbeatRuns.status, "cancelled"),
         eq(heartbeatRuns.runtimeMode, "legacy"),
+        sql`${agentWakeupRequests.payload}->>'issueHandoffSourceRunId' is null`,
         eq(companies.status, "active"),
         cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
       ));
@@ -26118,10 +26155,14 @@ export function heartbeatService(
       }
       // Terminalization precedes lease and adapter cleanup. Only now is the
       // owner gone; retry pending input for ordinary completions as well as Stop.
+      if (latestRun && hasCommittedIssueHandoff(latestRun)) {
+        await resumeCommittedIssueHandoffs({ runId: run.id });
+      }
       if (latestRun?.runtimeMode === "legacy" && isHeartbeatRunTerminalStatus(latestRun.status)) {
         const [pending] = await db.select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
           eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
           eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          sql`${agentWakeupRequests.payload}->>'issueHandoffSourceRunId' is null`,
           sql`${agentWakeupRequests.payload}->>'issueId' = ${String(latestRun.contextSnapshot?.issueId)}`,
         )).limit(1);
         if (pending) await (pending.payload?.queuedCommentInterrupt
@@ -26347,7 +26388,7 @@ export function heartbeatService(
       patch: Partial<typeof agentWakeupRequests.$inferInsert> = {},
       waitCondition?: Record<string, unknown>,
     ) => {
-      if (executionWaitRequestId) {
+      if (executionWaitRequestId || opts.handoffWakeupRequestId) {
         await db.update(agentWakeupRequests).set({
           payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}',
             coalesce(${agentWakeupRequests.payload}->'executionWait', '{}'::jsonb) || ${JSON.stringify({
@@ -26356,7 +26397,7 @@ export function heartbeatService(
                 : "Waiting for task execution to be enabled. Your message is saved."),
             })}::jsonb)`,
           updatedAt: new Date(),
-        }).where(and(eq(agentWakeupRequests.id, executionWaitRequestId),
+        }).where(and(eq(agentWakeupRequests.id, executionWaitRequestId ?? opts.handoffWakeupRequestId!),
           eq(agentWakeupRequests.companyId, agent.companyId), eq(agentWakeupRequests.agentId, agentId),
           eq(agentWakeupRequests.status, "deferred_issue_execution")));
         return { created: false };
@@ -26722,6 +26763,51 @@ export function heartbeatService(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
 
+          const recordAdmissionSkip = async (values: typeof agentWakeupRequests.$inferInsert) => {
+            if (!opts.handoffWakeupRequestId) {
+              await tx.insert(agentWakeupRequests).values(values);
+              return;
+            }
+            await tx.update(agentWakeupRequests).set({
+              payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}',
+                ${JSON.stringify({ reason: values.reason, details: values.payload?.heartbeatSkip ?? values.payload?.unresolvedBlockerIssueIds ?? null })}::jsonb)`,
+              updatedAt: new Date(),
+            }).where(and(eq(agentWakeupRequests.id, opts.handoffWakeupRequestId),
+              eq(agentWakeupRequests.companyId, agent.companyId), eq(agentWakeupRequests.agentId, agentId),
+              eq(agentWakeupRequests.status, "deferred_issue_execution")));
+          };
+
+          if (opts.handoffWakeupRequestId) {
+            const [pending] = await tx.select().from(agentWakeupRequests).where(and(
+              eq(agentWakeupRequests.id, opts.handoffWakeupRequestId), eq(agentWakeupRequests.companyId, agent.companyId),
+              eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+              sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+            )).for("update");
+            const sourceId = readNonEmptyString(pending?.payload?.issueHandoffSourceRunId);
+            const [stopped] = sourceId && isUuidLike(sourceId) ? await tx.select().from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.id, sourceId), eq(heartbeatRuns.companyId, agent.companyId),
+            )) : [];
+            if (!pending || !stopped || !hasCommittedIssueHandoff(stopped) ||
+                parseObject(stopped.resultJson?.issueHandoff).wakeupRequestId !== pending.id ||
+                pending.requestedByActorType !== opts.requestedByActorType ||
+                pending.requestedByActorId !== opts.requestedByActorId) return { kind: "deferred" as const };
+            const [current] = await tx.select().from(issues).where(and(eq(issues.companyId, agent.companyId), eq(issues.id, issueId)));
+            if (!current || current.assigneeAgentId !== agentId ||
+                current.statusVersion !== pending.payload?.issueHandoffStatusVersion ||
+                !isDeepStrictEqual(current.executionState, pending.payload?.issueHandoffExecutionState)) {
+              await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: new Date(),
+                error: "Task ownership or workflow changed after the committed handoff", updatedAt: new Date() })
+                .where(eq(agentWakeupRequests.id, pending.id));
+              return { kind: "skipped" as const };
+            }
+            const [successor] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.companyId, agent.companyId),
+              or(eq(heartbeatRuns.nativeIssueId, issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`),
+              inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+            )).limit(1);
+            if (successor) return { kind: "deferred" as const };
+          }
+
           if (executionWaitRequestId) {
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(
               eq(agentWakeupRequests.id, executionWaitRequestId), eq(agentWakeupRequests.companyId, agent.companyId),
@@ -26954,7 +27040,7 @@ export function heartbeatService(
             .then((rows) => rows[0] ?? null);
 
           if (!issue) {
-            await tx.insert(agentWakeupRequests).values({
+            await recordAdmissionSkip({
               ...durableReceiptFields,
               companyId: agent.companyId,
               agentId,
@@ -27094,11 +27180,11 @@ export function heartbeatService(
             executionBlocker: NonNullable<Awaited<ReturnType<typeof getExecutionBlocker>>>,
           ) => {
             const condition = { recoveryActionId: executionBlocker.recoveryActionId, ...continuationWait };
-            if (executionWaitRequestId) {
+            if (executionWaitRequestId || opts.handoffWakeupRequestId) {
               await tx.update(agentWakeupRequests).set({
                 payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}', ${JSON.stringify(condition)}::jsonb)`,
                 updatedAt: new Date(),
-              }).where(eq(agentWakeupRequests.id, executionWaitRequestId));
+              }).where(eq(agentWakeupRequests.id, executionWaitRequestId ?? opts.handoffWakeupRequestId!));
               return { kind: "deferred" as const };
             }
             if (durableRequest || wakeCommentId ||
@@ -27166,7 +27252,7 @@ export function heartbeatService(
               issue.assigneeAgentId !== issueStateGuard.assigneeAgentId ||
               (issueStateGuard.statusVersion !== undefined && issue.statusVersion !== issueStateGuard.statusVersion))
           ) {
-            await tx.insert(agentWakeupRequests).values({
+            await recordAdmissionSkip({
               ...durableReceiptFields,
               companyId: agent.companyId,
               agentId,
@@ -27198,7 +27284,7 @@ export function heartbeatService(
             worktreeExecutionCutoff &&
             issue.createdAt < worktreeExecutionCutoff
           ) {
-            await tx.insert(agentWakeupRequests).values({
+            await recordAdmissionSkip({
               ...durableReceiptFields,
               companyId: agent.companyId,
               agentId,
@@ -27507,6 +27593,11 @@ export function heartbeatService(
             !dependencyReadiness.isDependencyReady &&
             !blockedInteractionWake
           ) {
+            if (opts.handoffWakeupRequestId) {
+              await recordAdmissionSkip({ companyId: agent.companyId, agentId, source, status: "skipped",
+                reason: "issue_dependencies_blocked", payload: { unresolvedBlockerIssueIds: dependencyReadiness.unresolvedBlockerIssueIds } });
+              return { kind: "deferred" as const };
+            }
             await recordExecutionWait(tx as unknown as Db, {
               issueId: issue.id,
               coalesce: coalesceExecutionWait,
@@ -27628,7 +27719,7 @@ export function heartbeatService(
                 createdAt: now,
                 updatedAt: now,
               });
-              await tx.insert(agentWakeupRequests).values({
+              await recordAdmissionSkip({
                 ...durableReceiptFields,
                 companyId: agent.companyId,
                 agentId,
@@ -27835,7 +27926,7 @@ export function heartbeatService(
               });
 
               if (throttleDecision.blocked) {
-                await tx.insert(agentWakeupRequests).values({
+                await recordAdmissionSkip({
                   ...durableReceiptFields,
                   companyId: agent.companyId,
                   agentId,
@@ -27880,7 +27971,7 @@ export function heartbeatService(
               return deferBlockedExecution(executionBlocker);
             }
             const now = new Date();
-            await tx.insert(agentWakeupRequests).values({
+            await recordAdmissionSkip({
               ...durableReceiptFields,
               companyId: agent.companyId,
               agentId,
@@ -27929,9 +28020,7 @@ export function heartbeatService(
             enrichedContextSnapshot.explicitUserContinuation = explicitContinuation;
           }
 
-          const wakeupRequest = await tx
-            .insert(agentWakeupRequests)
-            .values({
+          const wakeupValues = {
               ...durableReceiptFields,
               companyId: agent.companyId,
               agentId,
@@ -27939,13 +28028,18 @@ export function heartbeatService(
               triggerDetail,
               reason,
               payload,
-              status: "queued",
+              status: "queued" as const,
               requestedByActorType: opts.requestedByActorType ?? null,
               requestedByActorId: opts.requestedByActorId ?? null,
               idempotencyKey: opts.idempotencyKey ?? null,
-            })
-            .returning()
-            .then((rows) => rows[0]);
+            };
+          const wakeupRequest = opts.handoffWakeupRequestId
+            ? await tx.update(agentWakeupRequests).set({ ...wakeupValues, error: null, claimedAt: null, finishedAt: null, updatedAt: new Date() })
+                .where(and(eq(agentWakeupRequests.id, opts.handoffWakeupRequestId),
+                  eq(agentWakeupRequests.companyId, agent.companyId), eq(agentWakeupRequests.agentId, agentId),
+                  eq(agentWakeupRequests.status, "deferred_issue_execution"))).returning().then(rows => rows[0])
+            : await tx.insert(agentWakeupRequests).values(wakeupValues).returning().then(rows => rows[0]);
+          if (!wakeupRequest) return { kind: "deferred" as const };
 
           // A handoff changes the executor, not the owner of saved user input.
           // Validate its exact stopped source while the issue row is locked;
@@ -27972,6 +28066,7 @@ export function heartbeatService(
                       eq(agentWakeupRequests.companyId, issue.companyId),
                       inArray(agentWakeupRequests.agentId, handoffSource ? [agentId, handoffSource.agentId] : [agentId]),
                       eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                      sql`${agentWakeupRequests.payload}->>'issueHandoffSourceRunId' is null`,
                       sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
                     ),
                   )
@@ -29561,6 +29656,7 @@ export function heartbeatService(
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+    resumeCommittedIssueHandoffs,
 
     scheduleBoundedRetry: async (
       runId: string,

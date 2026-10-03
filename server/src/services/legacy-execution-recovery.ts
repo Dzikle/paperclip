@@ -3,7 +3,7 @@ import { hasConversationContinuationPolicy } from "./conversation-continuation.j
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { and, eq, inArray, sql } from "drizzle-orm";
-import { heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
@@ -35,22 +35,31 @@ export function preserveIssueHandoff(result: Record<string, unknown> | null | un
     else '{}'::jsonb end`;
 }
 
+type HandoffRun = Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> &
+  Partial<Pick<Run, "id" | "companyId" | "agentId" | "nativeIssueId" | "contextSnapshot">>;
+
+export function hasCommittedIssueHandoff(run: HandoffRun): boolean {
+  const handoff = run.resultJson?.issueHandoff as Record<string, unknown> | undefined;
+  if (!(run.status === "cancelled" && run.errorCode === "issue_reassigned" &&
+      run.resultJson?.reassignmentStopConfirmed === true && run.id && run.companyId && run.agentId &&
+      handoff?.runId === run.id && handoff.companyId === run.companyId &&
+      handoff.agentId === run.agentId && typeof handoff.issueId === "string" &&
+      handoff.issueId === run.contextSnapshot?.issueId)) return false;
+  return run.runtimeMode === "native"
+    ? hasAcknowledgedNativeReassignmentStopIntent({ ...run, id: run.id, companyId: run.companyId, nativeIssueId: run.nativeIssueId ?? null })
+    : (run.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state === "acknowledged";
+}
+
 /** Error families describe availability, not whether earlier actions happened. */
 export function legacyExecutionNeedsReconciliation(
-  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "id" | "companyId" | "agentId" | "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot">>,
+  run: HandoffRun & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason">>,
 ): boolean {
   if (
     run.runtimeMode === "native" ||
     !["failed", "timed_out", "interrupted", "cancelled"].includes(run.status)
   )
     return false;
-  const handoff = run.resultJson?.issueHandoff as Record<string, unknown> | undefined;
-  if (run.status === "cancelled" && run.errorCode === "issue_reassigned" &&
-      run.resultJson?.reassignmentStopConfirmed === true && run.id && run.companyId && run.agentId &&
-      (run.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state === "acknowledged" &&
-      handoff?.runId === run.id && handoff.companyId === run.companyId &&
-      handoff.agentId === run.agentId && typeof handoff.issueId === "string" &&
-      handoff.issueId === run.contextSnapshot?.issueId) return false;
+  if (hasCommittedIssueHandoff(run)) return false;
   // A fresh conversation turn lets the agent decide what remains. The retry
   // scheduler, not an action-outcome hold, owns the automatic attempt limit.
   if (hasConversationContinuationPolicy(run.resultJson)) return false;
@@ -82,9 +91,16 @@ export function legacyExecutionNeedsReconciliation(
 /** Called in the task-update transaction, only for its authenticated author run. */
 export async function recordCommittedIssueHandoff(db: Db, input: {
   companyId: string; issueId: string; agentId: string; runId: string;
+  nextWakeup?: { agentId: string; wakeup: {
+    source: string; triggerDetail: string; reason: string;
+    payload: Record<string, unknown>; contextSnapshot: Record<string, unknown>;
+    requestedByActorType: string; requestedByActorId: string;
+  }; statusVersion: number; executionState: Record<string, unknown> | null } | null;
 }) {
   const now = new Date();
-  const handoff = { ...input, committedAt: now.toISOString() };
+  const { nextWakeup, ...identity } = input;
+  const wakeupRequestId = nextWakeup ? randomUUID() : null;
+  const handoff = { ...identity, committedAt: now.toISOString(), ...(wakeupRequestId ? { wakeupRequestId } : {}) };
   const [recorded] = await db.update(heartbeatRuns).set({
     resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ||
       ${JSON.stringify({ issueHandoff: handoff })}::jsonb`,
@@ -95,12 +111,32 @@ export async function recordCommittedIssueHandoff(db: Db, input: {
     eq(heartbeatRuns.errorCode, "issue_reassigned"),
     sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`,
     sql`${heartbeatRuns.resultJson}->'reassignmentStopConfirmed' = 'true'::jsonb`,
+    sql`not (coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ? 'issueHandoff')`,
   )).returning();
-  if (!recorded) throw new Error("The task handoff has no confirmed stopped author run");
+  if (!recorded) {
+    const [existing] = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId),
+      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`,
+    ));
+    if (existing && hasCommittedIssueHandoff(existing)) return;
+    throw new Error("The task handoff has no confirmed stopped author run");
+  }
   if ((recorded.runtimeMode === "native" && !hasAcknowledgedNativeReassignmentStopIntent(recorded)) ||
       (recorded.runtimeMode !== "native" &&
         (recorded.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state !== "acknowledged")) {
     throw new Error("The task handoff has no provider stop acknowledgement");
+  }
+  if (nextWakeup && wakeupRequestId) {
+    const { wakeup } = nextWakeup;
+    await db.insert(agentWakeupRequests).values({
+      id: wakeupRequestId, companyId: input.companyId, agentId: nextWakeup.agentId,
+      source: wakeup.source, triggerDetail: wakeup.triggerDetail, reason: wakeup.reason,
+      requestedByActorType: wakeup.requestedByActorType, requestedByActorId: wakeup.requestedByActorId,
+      status: "deferred_issue_execution", idempotencyKey: `issue-handoff:${input.runId}`,
+      payload: { ...wakeup.payload, issueId: input.issueId, issueHandoffSourceRunId: input.runId,
+        issueHandoffStatusVersion: nextWakeup.statusVersion, issueHandoffExecutionState: nextWakeup.executionState,
+        _paperclipWakeContext: wakeup.contextSnapshot },
+    });
   }
   // Stop terminalizes before assignment commits. Retire only that run's hold;
   // preserve unrelated failures and the original cancellation evidence.

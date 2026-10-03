@@ -24,7 +24,10 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getRun: vi.fn(async () => null),
   getActiveRunForAgent: vi.fn(async () => null),
   cancelRun: vi.fn(async () => null),
+  resumeCommittedIssueHandoffs: vi.fn(async () => undefined),
 }));
+
+const mockRecordHandoff = vi.hoisted(() => vi.fn(async () => undefined));
 
 const mockAccessService = vi.hoisted(() => ({
   canUser: vi.fn(async () => false),
@@ -74,6 +77,10 @@ const mockRunnerGoalService = vi.hoisted(() => ({
 }));
 
 function registerModuleMocks() {
+  vi.doMock("../services/legacy-execution-recovery.js", async (importOriginal) => ({
+    ...await importOriginal<typeof import("../services/legacy-execution-recovery.js")>(),
+    recordCommittedIssueHandoff: mockRecordHandoff,
+  }));
   vi.doMock("../services/queued-interaction-response.js", () => ({
     hasQueuedInteractionResponse: vi.fn(async () => false),
   }));
@@ -203,6 +210,8 @@ describe("issue execution policy routes", () => {
     vi.doUnmock("../middleware/index.js");
     registerModuleMocks();
     vi.clearAllMocks();
+    mockHeartbeatService.getRun.mockResolvedValue(null);
+    mockHeartbeatService.cancelRun.mockResolvedValue(null);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
@@ -264,6 +273,45 @@ describe("issue execution policy routes", () => {
     });
     mockAccessService.hasPermission.mockResolvedValue(false);
   });
+
+  it.each([false, true])("commits the next-stage wake without losing unrelated mentions (comment: %s)", async (withComment) => {
+    const runId = "55555555-5555-4555-8555-555555555555";
+    const agentId = "33333333-3333-4333-8333-333333333333";
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", companyId: "company-1",
+      status: "in_progress", statusVersion: 1, assigneeAgentId: agentId, assigneeUserId: null,
+      createdByUserId: "local-board", identifier: "PAP-1007", title: "Native handoff",
+      executionRunId: runId, checkoutRunId: runId, executionPolicy: null, executionState: null,
+    };
+    const run = { id: runId, companyId: issue.companyId, agentId, status: "running",
+      runtimeMode: "legacy", contextSnapshot: { issueId: issue.id } };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.getByIdForUpdate.mockResolvedValue(issue);
+    mockHeartbeatService.getRun.mockResolvedValue(run as never);
+    mockHeartbeatService.cancelRun.mockResolvedValue({ ...run, status: "cancelled" } as never);
+    mockIssueService.update.mockImplementation(async (_id, patch) => ({ ...issue, ...patch }));
+    const mentionedId = "66666666-6666-4666-8666-666666666666";
+    mockIssueService.addComment.mockResolvedValue({ id: "comment-1", companyId: issue.companyId, issueId: issue.id, body: "@Observer inspect" });
+    mockIssueService.findMentionedAgents.mockResolvedValue(withComment ? [mentionedId] : []);
+    mockHeartbeatService.resumeCommittedIssueHandoffs.mockImplementationOnce(async () => {
+      expect(mockRecordHandoff).toHaveBeenCalled();
+    });
+    const res = await request(await createApp({ type: "agent", companyId: issue.companyId, agentId, runId }))
+      .patch("/api/issues/" + issue.id)
+      .send({ status: "in_review", ...(withComment ? { comment: "@Observer inspect" } : {}), executionPolicy: { stages: [{ type: "review",
+        participants: [{ type: "agent", agentId: "44444444-4444-4444-8444-444444444444" }] }] } });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    await vi.waitFor(() => expect(mockHeartbeatService.resumeCommittedIssueHandoffs).toHaveBeenCalledWith({ runId }));
+    expect(mockRecordHandoff).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      nextWakeup: expect.objectContaining({ agentId: "44444444-4444-4444-8444-444444444444",
+        wakeup: expect.objectContaining({ reason: "execution_review_requested" }) }),
+    }));
+    if (withComment) {
+      await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(mentionedId,
+        expect.objectContaining({ reason: "issue_comment_mentioned" })));
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+    } else expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  }, 120_000);
 
   it("reauthorizes a terminal verdict against the review policy held under the update lock", async () => {
     const issue = {
