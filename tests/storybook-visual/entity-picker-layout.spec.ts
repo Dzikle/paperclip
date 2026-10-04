@@ -47,3 +47,20 @@ test("standalone mobile picker remains visible", async ({ page }) => {
   await page.getByRole("button", { name: "Mobile Experience", exact: true }).click();
   await expect(page.locator("[data-mobile-entity-picker]")).toHaveCount(0);
 });
+
+test("real New Task form allows mobile assignee and project selection", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 480 });
+  await page.goto("/iframe.html?id=product-dialogs-modals--new-issue-prefilled&viewMode=story");
+  const dialog = page.locator('[data-slot="dialog-content"]');
+  await expect(dialog).toBeVisible();
+  for (const picker of [
+    { choice: "CodexCoder", search: "Search assignees..." },
+    { choice: "Board UI", search: "Search projects..." },
+  ]) {
+    await dialog.getByRole("button", { name: picker.choice, exact: true }).click();
+    await assertUsablePicker(page, picker.search);
+    await page.getByPlaceholder(picker.search).fill(picker.choice);
+    await page.locator("[data-mobile-entity-picker]").getByRole("button", { name: picker.choice, exact: true }).click();
+    await expect(page.locator("[data-mobile-entity-picker]")).toHaveCount(0);
+  }
+});
