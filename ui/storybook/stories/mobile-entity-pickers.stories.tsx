@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { InlineEntitySelector, type InlineEntityOption } from "@/components/InlineEntitySelector";
+import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 
 const assignees: InlineEntityOption[] = [
   { id: "agent-product", label: "Product Lead", searchText: "planning product" },
@@ -55,4 +56,63 @@ export const AssigneePicker: Story = {
 
 export const ProjectPicker: Story = {
   render: () => <OpenPicker kind="Project" options={projects} />,
+};
+
+function DialogPickersExample() {
+  const [assignee, setAssignee] = useState("");
+  const [project, setProject] = useState("");
+  const [model, setModel] = useState("");
+
+  return (
+    <Dialog open>
+      <DialogContent
+        className="flex h-96 flex-col overflow-hidden p-0"
+        onOpenAutoFocus={(event) => event.preventDefault()}
+      >
+        <DialogTitle className="p-4">New task</DialogTitle>
+        <div className="min-h-0 flex-1 overflow-y-auto p-4">
+          <div className="flex flex-wrap gap-2">
+            <InlineEntitySelector
+              value={assignee}
+              options={assignees}
+              placeholder="Assignee"
+              noneLabel="No assignee"
+              searchPlaceholder="Search assignees..."
+              emptyMessage="No matching assignee."
+              onChange={setAssignee}
+              disablePortal
+            />
+            <InlineEntitySelector
+              value={project}
+              options={projects}
+              placeholder="Project"
+              noneLabel="No project"
+              searchPlaceholder="Search projects..."
+              emptyMessage="No matching project."
+              onChange={setProject}
+              disablePortal
+            />
+            <InlineEntitySelector
+              value={model}
+              options={[
+                { id: "fast", label: "Fast Model" },
+                { id: "quality", label: "Quality Model" },
+              ]}
+              placeholder="Model"
+              noneLabel="Default model"
+              searchPlaceholder="Search models..."
+              emptyMessage="No matching model."
+              onChange={setModel}
+              disablePortal
+            />
+          </div>
+        </div>
+        <div className="p-4">Select the worker, project and model.</div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+export const DialogPickers: Story = {
+  render: () => <DialogPickersExample />,
 };

@@ -3001,18 +3001,11 @@ span.paperclip-mention-chip[data-mention-kind="external-object"] {
   .runner-activity-roll-out { display: none; }
 }
 
-/* Keep entity-picker search controls visible when a narrow viewport opens its
-   software keyboard. The fixed sheet also avoids scale motion during mobile
-   viewport resizing. */
+/* Radix's wrapper owns popup positioning. Keep content in normal flow so the
+   wrapper retains its width when the mobile keyboard resizes the viewport. */
 @media (max-width: 40rem) {
   [data-mobile-entity-picker] {
-    position: fixed !important;
-    inset: auto calc(var(--spacing) * 4) max(calc(var(--spacing) * 4), env(safe-area-inset-bottom)) !important;
-    width: auto !important;
-    max-width: none !important;
     max-height: calc(100dvh - calc(var(--spacing) * 8)) !important;
-    transform: none !important;
-    transform-origin: bottom center !important;
     animation: none !important;
   }
 
