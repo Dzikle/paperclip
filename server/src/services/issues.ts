@@ -1,4 +1,5 @@
 import { documentService } from "./documents.js";
+import { assertIssueUpdateVersion } from "./issue-update-version.js";
 import { parseTaskSearch, taskSearchCtes, taskSearchScore } from "./task-search.js";
 import { createdFromIssueCondition } from "./issue-creation-origin.js";
 import { executionProjectionsForRuns } from "./execution-projection.js";
@@ -10469,6 +10470,7 @@ export function issueService(db: Db) {
         actorAgentId?: string | null;
         actorUserId?: string | null;
         companyGuard?: string;
+        expectedStatusVersion?: number;
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -10514,6 +10516,7 @@ export function issueService(db: Db) {
         actorAgentId,
         actorUserId,
         companyGuard,
+        expectedStatusVersion,
         ...issueData
       } = data;
       if (
@@ -10785,6 +10788,7 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        assertIssueUpdateVersion(receiptExisting.statusVersion, expectedStatusVersion);
         if (actorAgentId && patch.status === "done") {
           const [review] = await tx.select({ id: toolActionRequests.id }).from(toolActionRequests).where(and(eq(toolActionRequests.companyId, existing.companyId), eq(toolActionRequests.issueId, id), inArray(toolActionRequests.status, ["pending", "approved", "executing"]))).limit(1);
           if (review) throw conflict("This task is waiting for a connection review. Finish unrelated work, then yield in_review without retrying the governed call.", { code: "tool_review_pending", actionRequestId: review.id });

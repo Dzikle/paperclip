@@ -107,6 +107,18 @@ describe("company-members helpers", () => {
     ]);
   });
 
+  it("hides archived and runtime-hidden agents from task targets while keeping paused agents eligible", () => {
+    const options = buildMarkdownMentionOptions({
+      agents: [
+        { id: "archived", name: "Archived", status: "paused", icon: null, metadata: { archived: true } },
+        { id: "hidden", name: "Hidden", status: "active", icon: null, metadata: { runtimeBindingHidden: true } },
+        { id: "paused", name: "Paused", status: "paused", icon: null, metadata: {} },
+      ],
+    });
+
+    expect(options.map((option) => option.id)).toEqual(["agent:paused"]);
+  });
+
   it("appends issue mention options after agents and projects, preserving order", () => {
     const options = buildMarkdownMentionOptions({
       agents: [{ id: "agent-1", name: "CodexCoder", status: "active", icon: "code" }],

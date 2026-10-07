@@ -346,6 +346,24 @@ describe("Agents", () => {
     mockSidebarState.isMobile = false;
   });
 
+  it("hides metadata archived and fallback binding agents from the ordinary roster", async () => {
+    mockAgentsApi.list.mockResolvedValue([
+      makeAgent({ id: "visible", name: "Visible", metadata: {} }),
+      makeAgent({ id: "archived", name: "Archived fixture", status: "paused", metadata: { archived: true } }),
+      makeAgent({ id: "fallback", name: "Fallback fixture", metadata: { runtimeBindingHidden: true } }),
+    ]);
+    root = createRoot(container);
+    await act(async () => {
+      root!.render(<QueryClientProvider client={queryClient}><ToastProvider><Agents /></ToastProvider></QueryClientProvider>);
+    });
+    await flushReact();
+
+    expect(container.textContent).toContain("Visible");
+    expect(container.textContent).not.toContain("Archived fixture");
+    expect(container.textContent).not.toContain("Fallback fixture");
+    act(() => root!.unmount());
+  });
+
   afterEach(async () => {
     const currentRoot = root;
     if (currentRoot) {

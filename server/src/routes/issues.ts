@@ -1,4 +1,6 @@
 import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse } from "../services/queued-interaction-response.js";
+import { projectTaskIntakeDefaults } from "../services/project-task-intake.js";
+import { assertIssueUpdateVersion } from "../services/issue-update-version.js";
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
@@ -11766,6 +11768,36 @@ export function issueRoutes(
             }
           : {}),
       };
+      if (
+        req.actor.type === "board" &&
+        createBody.projectId &&
+        !createBody.parentId &&
+        !createBody.executionPolicy &&
+        rawCreateBody.assigneeAgentId === undefined &&
+        rawCreateBody.assigneeUserId === undefined
+      ) {
+        const project = await projectsSvc.getById(createBody.projectId);
+        if (project?.companyId === companyId && project.leadAgentId) {
+          const lead = await agentsSvc.getById(project.leadAgentId);
+          try {
+            Object.assign(
+              createBody,
+              projectTaskIntakeDefaults({
+                companyId,
+                actorType: "user",
+                body: rawCreateBody,
+                lead,
+              }),
+            );
+          } catch (error) {
+            throw unprocessable(
+              error instanceof Error
+                ? error.message
+                : "Project intake is unavailable",
+            );
+          }
+        }
+      }
       const createAssignmentScope = {
         projectId: await resolveAssignmentProjectId({
           companyId,
@@ -11781,7 +11813,7 @@ export function issueRoutes(
         companyId,
         createAssignmentScope,
       );
-      if (rawCreateBody.assigneeAgentId || rawCreateBody.assigneeUserId) {
+      if (createBody.assigneeAgentId || rawCreateBody.assigneeUserId) {
         await assertCanAssignTasks(req, companyId, createAssignmentScope);
       }
       await assertIssueEnvironmentSelection(
@@ -12787,6 +12819,7 @@ export function issueRoutes(
         { allowVisibleIssueWrite: true },
       );
       if (!issueMutationAccess) return;
+      assertIssueUpdateVersion(existing.statusVersion, req.body.expectedStatusVersion);
       if (req.body.comment && !(await assertBoardCommentNotPaused(req, res, existing))) return;
       const issueMutationAuthorizationReason =
         req.actor.type === "agent"
@@ -12820,6 +12853,7 @@ export function issueRoutes(
         resume: resumeRequested,
         interrupt: interruptRequested,
         deferWakeForGoal,
+        expectedStatusVersion,
         hiddenAt: hiddenAtRaw,
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
         ...updateFields
@@ -13193,6 +13227,47 @@ export function issueRoutes(
       Object.assign(updateFields, transition.patch);
 
       const nextStatus = updateFields.status ?? existing.status;
+      let automaticProjectIntakeApplied = false;
+      if (
+        req.actor.type === "board" &&
+        existing.status === "backlog" &&
+        nextStatus === "todo" &&
+        !existing.assigneeAgentId &&
+        !existing.assigneeUserId &&
+        !Object.hasOwn(req.body, "assigneeAgentId") &&
+        !Object.hasOwn(req.body, "assigneeUserId") &&
+        !(updateFields.parentId ?? existing.parentId) &&
+        !nextExecutionPolicy
+      ) {
+        const nextProjectId = updateFields.projectId === undefined
+          ? existing.projectId
+          : (updateFields.projectId as string | null);
+        if (nextProjectId) {
+          const project = await projectsSvc.getById(nextProjectId);
+          if (project?.companyId === existing.companyId && project.leadAgentId) {
+            const lead = await agentsSvc.getById(project.leadAgentId);
+            let intakeDefaults: { assigneeAgentId?: string };
+            try {
+              intakeDefaults = projectTaskIntakeDefaults({
+                companyId: existing.companyId,
+                actorType: "user",
+                body: { projectId: nextProjectId, status: "todo" },
+                lead,
+              });
+            } catch (error) {
+              throw unprocessable(
+                error instanceof Error
+                  ? error.message
+                  : "Project intake is unavailable",
+              );
+            }
+            if (intakeDefaults.assigneeAgentId) {
+              updateFields.assigneeAgentId = intakeDefaults.assigneeAgentId;
+              automaticProjectIntakeApplied = true;
+            }
+          }
+        }
+      }
       if (updateFields.unblockDescriptor && nextStatus !== "blocked") {
         throw unprocessable("unblockDescriptor requires blocked status");
       }
@@ -13513,6 +13588,12 @@ export function issueRoutes(
       const postCommitIssueActions: IssuePostCommitAction[] = [];
       const issueUpdateData = {
         ...updateFields,
+        ...(expectedStatusVersion !== undefined || automaticProjectIntakeApplied
+          ? {
+              expectedStatusVersion:
+                expectedStatusVersion ?? existing.statusVersion,
+            }
+          : {}),
         actorAgentId: actor.agentId ?? null,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
       };

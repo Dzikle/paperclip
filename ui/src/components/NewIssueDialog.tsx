@@ -1159,6 +1159,15 @@ export function NewIssueDialog() {
     : null;
   const currentAssigneeLowTrust = getTrustPreset(currentAssignee?.permissions) === "low_trust_review";
   const currentProject = orderedProjects.find((project) => project.id === projectId);
+  const projectIntakeLead = !isSubIssueMode && !selectedAssigneeAgentId && currentProject?.leadAgentId
+    ? (agents ?? []).find((agent) => agent.id === currentProject.leadAgentId)
+    : null;
+  const showAutomaticProjectIntake = !selectedAssigneeUserId
+    && !reviewerValue
+    && !approverValue
+    && projectIntakeLead?.metadata?.taskIntake === true
+    && ["idle", "running", "active"].includes(projectIntakeLead.status)
+    && isAgentTaskTarget(projectIntakeLead);
   const neededUserSecretKeys = useMemo(
     () => {
       if (!shouldWarnAboutRunUserSecrets(status, selectedAssigneeAgentId)) return [];
@@ -1577,6 +1586,9 @@ export function NewIssueDialog() {
                   );
                 }}
               />
+              {showAutomaticProjectIntake ? (
+                <span className="text-xs text-muted-foreground">Automatic (Orchestrator)</span>
+              ) : null}
 
               {/* Three-dot menu to add Reviewer / Approver rows */}
               <Popover open={participantMenuOpen} onOpenChange={setParticipantMenuOpen}>

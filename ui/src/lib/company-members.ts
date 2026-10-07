@@ -85,9 +85,11 @@ export function buildCompanyUserMentionOptions(
 }
 
 export function isAgentTaskTarget(
-  agent: Pick<Agent, "status"> & Partial<Pick<Agent, "orgChainHealth" | "appearance">>,
+  agent: Pick<Agent, "status"> & Partial<Pick<Agent, "orgChainHealth" | "appearance" | "metadata">>,
 ): boolean {
   return (
+    agent.metadata?.archived !== true &&
+    agent.metadata?.runtimeBindingHidden !== true &&
     agent.status !== "terminated" &&
     agent.status !== "pending_approval" &&
     agent.orgChainHealth?.status !== "invalid_org_chain"
@@ -116,7 +118,7 @@ export function buildIssueMentionOptions(
 }
 
 export function buildMarkdownMentionOptions(args: {
-  agents?: Array<Pick<Agent, "id" | "name" | "status" | "icon"> & Partial<Pick<Agent, "orgChainHealth" | "appearance">>> | null | undefined;
+  agents?: Array<Pick<Agent, "id" | "name" | "status" | "icon"> & Partial<Pick<Agent, "orgChainHealth" | "appearance" | "metadata">>> | null | undefined;
   projects?: Array<Pick<Project, "id" | "name" | "color">> | null | undefined;
   members?: CompanyUserRecord[] | null | undefined;
   issues?: Array<Pick<Issue, "id" | "identifier" | "title">> | null | undefined;

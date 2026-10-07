@@ -414,6 +414,131 @@ describe("NewIssueDialog", () => {
     act(() => rerendered.root.unmount());
   });
 
+  it("labels an unassigned project task with its opted-in orchestrator lead", async () => {
+    dialogState.newIssueDefaults = { projectId: "project-1" };
+    mockProjectsApi.list.mockResolvedValue([{
+      id: "project-1", name: "Alpha", description: null, archivedAt: null, color: "#445566", leadAgentId: "agent-1",
+    }]);
+    mockAgentsApi.list.mockResolvedValue([{
+      id: "agent-1", name: "Lead", role: "lead", status: "active", metadata: { taskIntake: true },
+    }]);
+
+    const { root } = renderDialog(container);
+    await flush();
+
+    expect(container.textContent).toContain("Automatic (Orchestrator)");
+    expect(container.textContent).toContain("Assignee");
+    expect(mockIssuesApi.create).not.toHaveBeenCalled();
+
+    act(() => root.unmount());
+  });
+
+  it("does not label project intake when a human is explicitly assigned", async () => {
+    dialogState.newIssueDefaults = { title: "Assigned task", projectId: "project-1", assigneeUserId: "user-2" };
+    mockProjectsApi.list.mockResolvedValue([{
+      id: "project-1", name: "Alpha", description: null, archivedAt: null, color: "#445566", leadAgentId: "agent-1",
+    }]);
+    mockAgentsApi.list.mockResolvedValue([{
+      id: "agent-1", name: "Lead", role: "lead", status: "active", metadata: { taskIntake: true },
+    }]);
+
+    const { root } = renderDialog(container);
+    await flush();
+
+    expect(container.textContent).not.toContain("Automatic (Orchestrator)");
+    expect(container.textContent).toContain("user-2");
+
+    act(() => root.unmount());
+  });
+
+  it.each(["paused", "error", "terminated", "pending_approval"])(
+    "does not label project intake when its lead status is %s",
+    async (leadStatus) => {
+      dialogState.newIssueDefaults = { projectId: "project-1" };
+      mockProjectsApi.list.mockResolvedValue([{
+        id: "project-1", name: "Alpha", description: null, archivedAt: null, color: "#445566", leadAgentId: "agent-1",
+      }]);
+      mockAgentsApi.list.mockResolvedValue([{
+        id: "agent-1", name: "Lead", role: "lead", status: leadStatus, metadata: { taskIntake: true },
+      }]);
+
+      const { root } = renderDialog(container);
+      await flush();
+
+      expect(container.textContent).not.toContain("Automatic (Orchestrator)");
+
+      act(() => root.unmount());
+    },
+  );
+
+  it.each(["idle", "running", "active"])("labels intake for a %s project lead", async (leadStatus) => {
+    dialogState.newIssueDefaults = { projectId: "project-1" };
+    mockProjectsApi.list.mockResolvedValue([{
+      id: "project-1", name: "Alpha", description: null, archivedAt: null, color: "#445566", leadAgentId: "agent-1",
+    }]);
+    mockAgentsApi.list.mockResolvedValue([{
+      id: "agent-1", name: "Lead", role: "lead", status: leadStatus, metadata: { taskIntake: true },
+    }]);
+
+    const { root } = renderDialog(container);
+    await flush();
+
+    expect(container.textContent).toContain("Automatic (Orchestrator)");
+
+    act(() => root.unmount());
+  });
+
+  it("does not label project intake for a sub-issue", async () => {
+    dialogState.newIssueDefaults = { parentId: "issue-1", projectId: "project-1" };
+    mockProjectsApi.list.mockResolvedValue([{
+      id: "project-1", name: "Alpha", description: null, archivedAt: null, color: "#445566", leadAgentId: "agent-1",
+    }]);
+    mockAgentsApi.list.mockResolvedValue([{
+      id: "agent-1", name: "Lead", role: "lead", status: "active", metadata: { taskIntake: true },
+    }]);
+
+    const { root } = renderDialog(container);
+    await flush();
+
+    expect(container.textContent).not.toContain("Automatic (Orchestrator)");
+
+    act(() => root.unmount());
+  });
+
+  it.each([
+    ["reviewer", { reviewerValue: "agent:agent-2" }],
+    ["approver", { approverValue: "user:user-2" }],
+  ])("does not label project intake when a %s execution participant is configured", async (_participant, policyValues) => {
+    dialogState.newIssueDefaults = {};
+    localStorage.setItem("paperclip:issue-draft", JSON.stringify({
+      title: "Draft task",
+      description: "",
+      status: "todo",
+      priority: "",
+      assigneeValue: "",
+      reviewerValue: "",
+      approverValue: "",
+      projectId: "project-1",
+      assigneeModelOverride: "",
+      assigneeThinkingEffort: "",
+      assigneeChrome: false,
+      ...policyValues,
+    }));
+    mockProjectsApi.list.mockResolvedValue([{
+      id: "project-1", name: "Alpha", description: null, archivedAt: null, color: "#445566", leadAgentId: "agent-1",
+    }]);
+    mockAgentsApi.list.mockResolvedValue([{
+      id: "agent-1", name: "Lead", role: "lead", status: "active", metadata: { taskIntake: true },
+    }]);
+
+    const { root } = renderDialog(container);
+    await flush();
+
+    expect(container.textContent).not.toContain("Automatic (Orchestrator)");
+
+    act(() => root.unmount());
+  });
+
   it("uses the compact composer control proportions for mobile task fields", async () => {
     const { root } = renderDialog(container);
     await flush();

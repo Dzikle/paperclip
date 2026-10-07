@@ -99,6 +99,7 @@ function filterAgents(agents: Agent[], tab: FilterTab, builtInAgentIds: Set<stri
   return agents
     .filter((a) => {
       if (HIDDEN_AGENT_STATUSES.has(a.status)) return false;
+      if (a.metadata?.archived === true || a.metadata?.runtimeBindingHidden === true) return false;
       // The `builtin` filter keys on the built-in marker, not agent status.
       if (tab === "builtin") return builtInAgentIds.has(a.id);
       return matchesFilter(a.status, tab);
