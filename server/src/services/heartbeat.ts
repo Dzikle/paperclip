@@ -1,4 +1,5 @@
 import { publicChatTaskUrl } from "./chat-task-url.js";
+import { hasProviderFallback, providerFallbackRuntime, type ProviderFallbackReceipt } from "./provider-fallback-runtime.js";
 import { isDeepStrictEqual } from "node:util";
 import { toolActionDeliveryService } from "./tool-action-delivery.js";
 import { githubBotConnectionIdsForRun } from "./chat-github-tools.js";
@@ -15235,6 +15236,7 @@ export function heartbeatService(
       wakeReason?: string;
       maxAttempts?: number;
       delayMs?: number;
+      providerFallback?: ProviderFallbackReceipt;
     },
   ) {
     const now = opts?.now ?? new Date();
@@ -15248,7 +15250,7 @@ export function heartbeatService(
         opts?.maxAttempts ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
       ),
     );
-    const nextAttempt =
+    const nextAttempt = retryReason === "provider_fallback" ? 1 :
       (retryReason === WORKSPACE_BUSY_RETRY_REASON ||
       retryReason === AI_CONNECTION_BUSY_RETRY_REASON ||
       retryReason === MAX_TURN_CONTINUATION_RETRY_REASON
@@ -15383,7 +15385,8 @@ export function heartbeatService(
       retryReason === AI_CONNECTION_BUSY_RETRY_REASON ||
       retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
       retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON;
-    if (requiresIssueGate) {
+    const requiresProviderFallbackGate = retryReason === "provider_fallback";
+    if (requiresIssueGate || requiresProviderFallbackGate) {
       const gate = await runDispatch.evaluateScheduledRetryGate({
         runId: run.id,
         companyId: run.companyId,
@@ -15443,6 +15446,7 @@ export function heartbeatService(
         retryOfRunId: run.id,
         wakeReason,
         retryReason,
+        ...(opts?.providerFallback ? { forceFreshSession: true } : {}),
         ...(retryReason === WORKSPACE_BUSY_RETRY_REASON
           ? {
               failureRetriesBeforeWorkspaceWait:
@@ -15791,6 +15795,18 @@ export function heartbeatService(
           }
         }
 
+        if (retryReason === "provider_fallback") {
+          const [lockedIssue] = issueId ? await tx.select().from(issues).where(and(eq(issues.id,issueId),eq(issues.companyId,run.companyId))) : [];
+          if (!lockedIssue || lockedIssue.status !== "in_progress" || lockedIssue.assigneeAgentId !== run.agentId || lockedIssue.executionRunId !== run.id) {
+            return {outcome:"not_scheduled",issueId,errorCode:"issue_execution_lock_changed",reason:"Provider fallback suppressed because task ownership changed",details:{issueId}};
+          }
+          const primary = await getAgent(run.agentId);
+          const rechecked = primary ? await providerFallbackRuntime(tx as unknown as Db).prepare(run,primary) : null;
+          if (!opts?.providerFallback || !isDeepStrictEqual(rechecked,opts.providerFallback)) {
+            return {outcome:"not_scheduled",issueId,errorCode:"issue_execution_lock_changed",reason:"Provider fallback qualification changed",details:{issueId}};
+          }
+        }
+
         const wakeupRequest = await tx
           .insert(agentWakeupRequests)
           .values({
@@ -15848,10 +15864,13 @@ export function heartbeatService(
             status: "scheduled_retry",
             wakeupRequestId: wakeupRequest.id,
             contextSnapshot: retryContextSnapshot,
+            ...((opts?.providerFallback || hasProviderFallback(run)) ? {
+              runnerProfileJson: {providerFallback:opts?.providerFallback ?? parseObject(run.runnerProfileJson).providerFallback},
+            } : {}),
             ...(hasConversationContinuationPolicy(run.resultJson)
               ? { resultJson: { conversationContinuation: CONVERSATION_CONTINUATION_POLICY } } : {}),
             responsibleUserId,
-            sessionIdBefore: sessionBefore,
+            sessionIdBefore: opts?.providerFallback ? null : sessionBefore,
             retryOfRunId: run.id,
             scheduledRetryAt: schedule.dueAt,
             scheduledRetryAttempt: schedule.attempt,
@@ -16367,6 +16386,19 @@ export function heartbeatService(
   }
 
   async function promoteDueScheduledRetries(now = new Date()) {
+    if ((await getSchedulingSuppression()).suppressed) return {promoted:0,runIds:[]};
+    // Recover the failure -> scheduling crash window using the existing sweep.
+    // Only a failed bootstrap still owning its task can mint a successor.
+    const pendingProviderFailures = await db.select({run:heartbeatRuns}).from(heartbeatRuns)
+      .innerJoin(issues,and(eq(issues.executionRunId,heartbeatRuns.id),eq(issues.companyId,heartbeatRuns.companyId)))
+      .where(and(eq(heartbeatRuns.status,"failed"),eq(heartbeatRuns.errorCode,"provider_unavailable_bootstrap")))
+      .limit(10);
+    for (const {run:failed} of pendingProviderFailures) {
+      if (activeRunExecutions.has(failed.id) || legacyExecutionNeedsReconciliation(failed)) continue;
+      const primary = await getAgent(failed.agentId);
+      const receipt = primary ? await providerFallbackRuntime(db).prepare(failed,primary) : null;
+      if (receipt && primary) await scheduleBoundedRetryForRun(failed,primary,{now,retryReason:"provider_fallback",wakeReason:"provider_fallback",maxAttempts:1,delayMs:1000,providerFallback:receipt});
+    }
     const cutoff = await getWorktreeExecutionCutoff();
     const result = await runDispatch.promoteDueScheduledRetries({
       now,
@@ -17175,13 +17207,22 @@ export function heartbeatService(
     companyAgents?: AgentOrgRow[],
   ) {
     if (run.status !== "queued") return run;
-    const agent = await getAgent(run.agentId);
+    let agent = await getAgent(run.agentId);
     if (!agent) {
       await cancelRunInternal(
         run.id,
         "Cancelled because the agent no longer exists",
       );
       return null;
+    }
+    if (hasProviderFallback(run)) {
+      const sourceId = readNonEmptyString(parseObject(parseObject(run.runnerProfileJson).providerFallback).sourceRunId);
+      if (sourceId && activeRunExecutions.has(sourceId)) return null;
+      try { agent = await providerFallbackRuntime(db).resolve(run,agent); }
+      catch {
+        await cancelRunInternal(run.id,"Provider fallback qualification or ownership is no longer valid",{suppressImmediateRecovery:true});
+        return null;
+      }
     }
     const invokability = companyAgents
       ? evaluateAgentInvokability(toAgentOrgRow(agent), companyAgents)
@@ -19040,8 +19081,8 @@ export function heartbeatService(
 
     for (const {
       run,
-      adapterType,
-      adapterConfig,
+      adapterType: mutableAdapterType,
+      adapterConfig: mutableAdapterConfig,
       nativeCoordinatorPhase,
       nativeRecoveryState,
       nativeControllerBootId,
@@ -19049,6 +19090,10 @@ export function heartbeatService(
       nativeControllerProcessStartedAt,
       nativeControllerLeaseExpiresAt,
     } of activeRuns) {
+      const adapterType = claimedAdapterType(run) ?? mutableAdapterType;
+      const fallbackProfile = parseObject(parseObject(parseObject(run.runnerProfileJson).providerFallback).profile);
+      const adapterConfig = hasProviderFallback(run) ? {...parseObject(mutableAdapterConfig),model:fallbackProfile.model,
+        extraArgs:fallbackProfile.extraArgs,command:"codex"} : mutableAdapterConfig;
       // Authentication timeout requires an explicit ownership resolution, not
       // repeated reattachment or a process-gone guess on subsequent sweeps.
       if (isNativeRunnerOwnershipHeld(run)) continue;
@@ -20161,7 +20206,7 @@ export function heartbeatService(
     let providerTraceFinalized = false;
 
     try {
-      const agent = await getAgent(run.agentId);
+      let agent = await getAgent(run.agentId);
       if (!agent) {
         await setRunStatus(runId, "failed", {
           error: "Agent not found",
@@ -20176,6 +20221,8 @@ export function heartbeatService(
         if (failedRun) await releaseIssueExecutionAndPromote(failedRun);
         return;
       }
+
+      agent = await providerFallbackRuntime(db).resolve(run,agent);
 
       // The claimed adapter identity is immutable recovery evidence. Do not
       // execute a newly selected adapter under a previous adapter's claim.
@@ -20412,7 +20459,7 @@ export function heartbeatService(
               })
           : null;
       const issueAssigneeOverrides =
-        issueContext && issueContext.assigneeAgentId === agent.id
+        !hasProviderFallback(run) && issueContext && issueContext.assigneeAgentId === agent.id
           ? parseIssueAssigneeAdapterOverrides(
               issueContext.assigneeAdapterOverrides,
             )
@@ -20618,6 +20665,12 @@ export function heartbeatService(
         context.executionPolicy = retainedTrust.executionPolicy;
       }
       const config = parseObject(agent.adapterConfig);
+      if (hasProviderFallback(run)) {
+        context.forceFreshSession = true;
+        delete context.resumeSessionParams;
+        delete context.resumeSessionDisplayId;
+        delete context.executionContinuation;
+      }
       const taskSession = taskKey
         ? await getTaskSession(
             agent.companyId,
@@ -25225,7 +25278,15 @@ export function heartbeatService(
               `[paperclip] Failed to resolve run presentation: ${err instanceof Error ? err.message : String(err)}\n`,
             );
           }
-          if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
+          const providerFallbackReceipt = outcome === "failed"
+            ? await providerFallbackRuntime(db).prepare(livenessRun,agent) : null;
+          if (providerFallbackReceipt && !legacyExecutionNeedsReconciliation(livenessRun)) {
+            await scheduleBoundedRetryForRun(livenessRun,agent,{retryReason:"provider_fallback",wakeReason:"provider_fallback",maxAttempts:1,delayMs:1000,providerFallback:providerFallbackReceipt});
+          } else if (outcome === "failed" && livenessRun.errorCode === "provider_unavailable_bootstrap") {
+            await appendRunEvent(livenessRun,{eventType:"lifecycle",stream:"system",level:"warn",
+              message:"Provider bootstrap unavailable; no further qualified provider switch is authorized",
+              payload:{providerSwitchExhausted:true}});
+          } else if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
             const policy = parseMaxTurnContinuationPolicy(agent);
             if (policy.enabled && policy.maxAttempts > 0) {
               await scheduleBoundedRetryForRun(livenessRun, agent, {
@@ -25268,7 +25329,7 @@ export function heartbeatService(
           );
           const conversationSettled = await settleConversationTurn(db, livenessRun);
           await releaseIssueExecutionAndPromote(livenessRun, {
-            suppressImmediateRecovery: conversationSettled ||
+            suppressImmediateRecovery: conversationSettled || hasProviderFallback(livenessRun) || providerFallbackReceipt !== null ||
               (livenessRun.status === "cancelled" && livenessRun.errorCode === "issue_reassigned") ||
               readNonEmptyString(
                 parseObject(livenessRun.contextSnapshot).goalControlRequestId,
@@ -26196,11 +26257,13 @@ export function heartbeatService(
     options: { suppressImmediateRecovery?: boolean } = {},
   ) {
     try {
+      const persisted = await getRun(run.id);
       const { postCommitEffects } = await wakeQueue.releaseIssueExecution({
         companyId: run.companyId,
         runId: run.id,
         now: new Date(),
-        suppressImmediateRecovery: options.suppressImmediateRecovery,
+        suppressImmediateRecovery: options.suppressImmediateRecovery || (persisted &&
+          (hasProviderFallback(persisted) || persisted.errorCode === "provider_unavailable_bootstrap")) || false,
       });
       await applyWakeQueuePostCommitEffects(postCommitEffects);
     } catch (error) {
@@ -29009,7 +29072,7 @@ export function heartbeatService(
                 processGroupId: running.processGroupId,
                 // Codex handles Ctrl-C by cancelling its tool sessions. SIGTERM
                 // can leave commands in their separate process groups alive.
-                signal: !control && agent?.adapterType === "codex_local" ? "SIGINT" : undefined,
+                signal: !control && (claimedAdapterType(run) ?? agent?.adapterType) === "codex_local" ? "SIGINT" : undefined,
                 graceMs: cancellationTerminationGraceMs(
                   running.graceSec,
                   options.terminationGraceMs,

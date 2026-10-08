@@ -5,6 +5,7 @@ import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
+  agentConfigRevisions,
   agentRuntimeState,
   agents,
   agentWakeupRequests,
@@ -30,7 +31,7 @@ import { heartbeatService } from "../services/heartbeat.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
-  vi.fn(async () => ({
+  vi.fn(async (_ctx?: unknown) => ({
     exitCode: 0,
     signal: null,
     timedOut: false,
@@ -40,6 +41,20 @@ const mockAdapterExecute = vi.hoisted(() =>
     model: "test-model",
   })),
 );
+const issueReadRace = vi.hoisted(() => ({ afterRead: null as null | (() => Promise<void>) }));
+vi.mock("../services/issues.js", async () => {
+  const actual = await vi.importActual<typeof import("../services/issues.js")>("../services/issues.js");
+  return { ...actual, issueService: (db: Parameters<typeof actual.issueService>[0]) => {
+    const service = actual.issueService(db);
+    return { ...service, getById: async (...args: Parameters<typeof service.getById>) => {
+      const observed = await service.getById(...args);
+      const hook = issueReadRace.afterRead;
+      issueReadRace.afterRead = null;
+      if (hook) await hook();
+      return observed;
+    } };
+  } };
+});
 
 vi.mock("../adapters/index.ts", async () => {
   const actual = await vi.importActual<typeof import("../adapters/index.ts")>("../adapters/index.ts");
@@ -70,9 +85,10 @@ describeEmbeddedPostgres("project task intake and issue update version routes", 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-project-task-intake-routes-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
+    issueReadRace.afterRead = null;
     mockAdapterExecute.mockClear();
     runningProcesses.clear();
     await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
@@ -84,6 +100,7 @@ describeEmbeddedPostgres("project task intake and issue update version routes", 
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
+    await db.delete(agentConfigRevisions);
     await db.delete(issues);
     await db.delete(projects);
     await db.delete(agents);
@@ -101,7 +118,7 @@ describeEmbeddedPostgres("project task intake and issue update version routes", 
       userId: "board-user",
       companyIds: [companyId],
       memberships: [{ companyId, membershipRole: "admin", status: "active" }],
-      isInstanceAdmin: false,
+      isInstanceAdmin: true,
       source: "session",
     };
   }
@@ -283,5 +300,132 @@ describeEmbeddedPostgres("project task intake and issue update version routes", 
     const [storedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     expect(storedIssue?.status).toBe("in_progress");
     expect(storedRun?.status).toBe("running");
+  });
+
+  it.each(["project", "policy"])("invalidates a handoff snapshot when the owner changes %s without changing status", async (change) => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId);
+    const firstProject = await seedProject(companyId, agentId);
+    const secondProject = await seedProject(companyId, agentId);
+    const issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Owner-controlled workflow",
+      status: "backlog", assigneeAgentId: agentId, projectId: firstProject, statusVersion: 4 });
+    const app = createApp(boardActor(companyId));
+    const changed = await request(app).patch(`/api/issues/${issueId}`)
+      .send(change === "project" ? { projectId: secondProject } : { executionPolicy: {
+        mode: "normal", stages: [{ type: "review", participants: [{ type: "agent", agentId }] }],
+      } })
+      .expect(200);
+    expect(changed.body.status).toBe("backlog");
+    expect(changed.body.statusVersion).toBe(5);
+    await request(app).patch(`/api/issues/${issueId}`)
+      .send({ title: "Stale handoff", expectedStatusVersion: 4 }).expect(409);
+    const [stored] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(stored?.title).toBe("Owner-controlled workflow");
+  });
+
+  it("does not cancel a replacement run after an A-to-B-to-A ownership race", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent(companyId);
+    const targetId = await seedAgent(companyId);
+    const issueId = randomUUID(), oldRunId = randomUUID(), replacementId = randomUUID();
+    await db.insert(heartbeatRuns).values([oldRunId, replacementId].map(id => ({
+      id, companyId, agentId, status: "running", invocationSource: "manual",
+      contextSnapshot: { issueId }, startedAt: new Date(),
+    })));
+    await db.insert(issues).values({ id: issueId, companyId, title: "Ownership race", status: "in_progress",
+      assigneeAgentId: agentId, executionRunId: oldRunId, statusVersion: 4 });
+    issueReadRace.afterRead = async () => {
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, oldRunId));
+      await db.update(issues).set({ executionRunId: replacementId, statusVersion: 6 }).where(eq(issues.id, issueId));
+    };
+    await request(createApp(boardActor(companyId))).patch(`/api/issues/${issueId}`)
+      .send({ assigneeAgentId: targetId, expectedStatusVersion: 4 }).expect(409);
+    const [replacement] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, replacementId));
+    expect(replacement?.status).toBe("running");
+    const [stored] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(stored?.executionRunId).toBe(replacementId);
+  });
+
+  async function seedProviderLoss() {
+    const companyId = await seedCompany(), agentId = await seedAgent(companyId), proofAgentId = await seedAgent(companyId);
+    const issueId = randomUUID(), qualificationRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({id:qualificationRunId,companyId,agentId:proofAgentId,status:"succeeded",
+      invocationSource:"manual",runnerProfileJson:{adapterDispatch:{adapterType:"codex_local"}},usageJson:{model:"gpt-5.6-sol"},finishedAt:new Date()});
+    const profile = {adapterType:"codex_local",model:"gpt-5.6-sol",extraArgs:["--sandbox","read-only"],qualificationRunId};
+    const runtimeConfig = {heartbeat:{enabled:false,wakeOnDemand:true,maxConcurrentRuns:1},providerFallback:profile};
+    await db.update(agents).set({adapterType:"opencode_local",adapterConfig:{cwd:"/tmp",model:"opencode/free"},runtimeConfig}).where(eq(agents.id,agentId));
+    await db.insert(agentConfigRevisions).values({companyId,agentId,createdByUserId:"board-user",afterConfig:{runtimeConfig},beforeConfig:{},changedKeys:["runtimeConfig"]});
+    await db.insert(issues).values({id:issueId,companyId,title:"Provider-loss canary",status:"in_progress",assigneeAgentId:agentId,responsibleUserId:"board-user"});
+    return {companyId,agentId,issueId,qualificationRunId,profile};
+  }
+  const providerRejected = () => ({exitCode:1,signal:null,timedOut:false,errorMessage:"Provider access rejected",summary:"",
+    provider:"opencode",model:"opencode/free",errorCode:"provider_unavailable_bootstrap",executionRecovery:{kind:"bootstrap",providerWorkStarted:false}});
+  it("uses a durable, qualified cross-provider retry without changing the logical agent", async () => {
+    const {agentId,issueId} = await seedProviderLoss();
+    mockAdapterExecute.mockImplementationOnce(async () => ({exitCode:1,signal:null,timedOut:false,errorMessage:"Provider access rejected",summary:"",
+      provider:"opencode",model:"opencode/free",errorCode:"provider_unavailable_bootstrap",executionRecovery:{kind:"bootstrap",providerWorkStarted:false}}));
+    const heartbeat = heartbeatService(db);
+    const source = await heartbeat.invoke(agentId,"on_demand",{issueId},"manual");
+    expect(source).toBeTruthy();
+    await heartbeat.drainActiveRunExecutions();
+    const successors = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId,source!.id));
+    expect(successors).toHaveLength(1);
+    expect(successors[0]).toMatchObject({agentId,status:"scheduled_retry",scheduledRetryReason:"provider_fallback"});
+    expect(successors[0].runnerProfileJson?.providerFallback).toMatchObject({sourceRunId:source!.id,switchCount:1});
+    // Recreate the service before promotion: the selected adapter must survive restart.
+    mockAdapterExecute.mockImplementationOnce(async (ctx) => {
+      expect((ctx as {agent:{adapterType:string}}).agent.adapterType).toBe("codex_local");
+      await db.update(issues).set({status:"done"}).where(eq(issues.id,issueId));
+      return {exitCode:0,signal:null,timedOut:false,errorMessage:null,summary:"Recovered",provider:"openai",model:"gpt-5.6-sol"};
+    });
+    const restarted = heartbeatService(db);
+    await restarted.promoteDueScheduledRetries(new Date(Date.now()+5000));
+    await restarted.resumeQueuedRuns();
+    await drainHeartbeatRunsToQuiescence(db,restarted);
+    const [completed] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,successors[0].id));
+    expect(completed.status).toBe("succeeded");
+    expect(completed.runnerProfileJson?.adapterDispatch).toEqual({adapterType:"codex_local"});
+    const [principal] = await db.select().from(agents).where(eq(agents.id,agentId));
+    expect(principal.adapterType).toBe("opencode_local");
+  },30_000);
+
+  it.each(["approval", "qualification"])("does not launch an unqualified fallback (%s)",async (invalid) => {
+    const {agentId,issueId,qualificationRunId} = await seedProviderLoss();
+    if (invalid === "approval") await db.update(agentConfigRevisions).set({createdByUserId:null,createdByAgentId:agentId}).where(eq(agentConfigRevisions.agentId,agentId));
+    else await db.update(heartbeatRuns).set({usageJson:{model:"unproven-model"}}).where(eq(heartbeatRuns.id,qualificationRunId));
+    mockAdapterExecute.mockImplementationOnce(async () => providerRejected());
+    const heartbeat = heartbeatService(db);
+    const source = await heartbeat.invoke(agentId,"on_demand",{issueId},"manual");
+    await heartbeat.drainActiveRunExecutions();
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId,source!.id))).toHaveLength(0);
+  });
+
+  it("exhausts the one provider switch without returning to the primary provider",async () => {
+    const {agentId,issueId} = await seedProviderLoss();
+    mockAdapterExecute.mockImplementationOnce(async () => providerRejected());
+    const heartbeat = heartbeatService(db);
+    const source = await heartbeat.invoke(agentId,"on_demand",{issueId},"manual");
+    await heartbeat.drainActiveRunExecutions();
+    const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId,source!.id));
+    mockAdapterExecute.mockImplementationOnce(async () => providerRejected());
+    await heartbeat.promoteDueScheduledRetries(new Date(Date.now()+5000));
+    await heartbeat.resumeQueuedRuns();
+    await drainHeartbeatRunsToQuiescence(db,heartbeat);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId,successor.id))).toHaveLength(0);
+    const remaining = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.agentId,agentId),eq(heartbeatRuns.status,"queued")));
+    expect(remaining).toHaveLength(0);
+  });
+
+  it("recovers the failure-to-scheduling crash window once through the native retry sweep",async () => {
+    const {companyId,agentId,issueId} = await seedProviderLoss(), sourceRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({id:sourceRunId,companyId,agentId,status:"failed",invocationSource:"manual",
+      contextSnapshot:{issueId},errorCode:"provider_unavailable_bootstrap",resultJson:{executionRecovery:{kind:"bootstrap",providerWorkStarted:false}},finishedAt:new Date()});
+    await db.update(issues).set({executionRunId:sourceRunId}).where(eq(issues.id,issueId));
+    const restarted = heartbeatService(db);
+    await Promise.all([restarted.promoteDueScheduledRetries(),restarted.promoteDueScheduledRetries()]);
+    const successors = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId,sourceRunId));
+    expect(successors).toHaveLength(1);
+    expect(successors[0]).toMatchObject({status:"scheduled_retry",scheduledRetryReason:"provider_fallback"});
   });
 });

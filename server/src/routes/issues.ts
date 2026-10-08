@@ -3594,8 +3594,10 @@ export function issueRoutes(
     companyId: string;
     issueId: string;
     agentId: string;
+    observedProjection?: Awaited<ReturnType<typeof runnerGoals.projection>>;
+    beforeAction?: () => Promise<void>;
   }) => {
-    const current = await runnerGoals.projection(
+    const current = input.observedProjection !== undefined ? input.observedProjection : await runnerGoals.projection(
       input.companyId,
       input.issueId,
       input.agentId,
@@ -3618,6 +3620,7 @@ export function issueRoutes(
         { code: "runner_goal_stop_unsupported", projection: current },
       );
     }
+    await input.beforeAction?.();
     await runnerGoals.act(input.companyId, input.issueId, {
       requestId: `ownership_${randomUUID()}`,
       agentId: input.agentId,
@@ -12820,6 +12823,31 @@ export function issueRoutes(
       );
       if (!issueMutationAccess) return;
       assertIssueUpdateVersion(existing.statusVersion, req.body.expectedStatusVersion);
+      // Conditional writes must never discover and stop a newer owner's run.
+      // Pin both provider identities before any ownership-changing side effect.
+      const guardedUpdate = req.body.expectedStatusVersion !== undefined;
+      const observedGoalProjection = guardedUpdate && existing.assigneeAgentId
+        ? await runnerGoals.projection(existing.companyId, existing.id, existing.assigneeAgentId)
+        : undefined;
+      const assertGuardedMutationCurrent = async () => {
+        if (!guardedUpdate) return;
+        const current = await svc.getById(existing.id);
+        if (!current) throw conflict("Task no longer exists");
+        assertIssueUpdateVersion(current.statusVersion, req.body.expectedStatusVersion);
+        if (current.assigneeAgentId !== existing.assigneeAgentId ||
+            current.assigneeUserId !== existing.assigneeUserId ||
+            current.executionRunId !== existing.executionRunId) {
+          throw conflict("Task execution ownership changed; refresh before updating", {
+            code: "issue_update_execution_conflict",
+          });
+        }
+      };
+      const resolveMutationRun = async () => {
+        if (!guardedUpdate) return resolveActiveIssueRun(existing);
+        await assertGuardedMutationCurrent();
+        const run = existing.executionRunId ? await heartbeat.getRun(existing.executionRunId) : null;
+        return run?.status === "running" && run.agentId === existing.assigneeAgentId ? run : null;
+      };
       if (req.body.comment && !(await assertBoardCommentNotPaused(req, res, existing))) return;
       const issueMutationAuthorizationReason =
         req.actor.type === "agent"
@@ -13096,8 +13124,9 @@ export function issueRoutes(
           return;
         }
 
-        const runToInterrupt = await resolveActiveIssueRun(existing);
+        const runToInterrupt = await resolveMutationRun();
         if (runToInterrupt) {
+          await assertGuardedMutationCurrent();
           const cancelled = await heartbeat.cancelRun(
             runToInterrupt.id,
             "Interrupted by board comment",
@@ -13130,7 +13159,7 @@ export function issueRoutes(
 
       const runToCancelForCancelledStatus =
         shouldCancelActiveRunForCancelledStatus
-          ? await resolveActiveIssueRun(existing)
+          ? await resolveMutationRun()
           : null;
 
       if (hiddenAtRaw !== undefined) {
@@ -13479,13 +13508,17 @@ export function issueRoutes(
       }
 
       if (assigneeWillChange && existing.assigneeAgentId) {
+        await assertGuardedMutationCurrent();
         await stopRunnerGoalForOwnershipChange({
           companyId: existing.companyId,
           issueId: existing.id,
           agentId: existing.assigneeAgentId,
+          observedProjection: observedGoalProjection,
+          beforeAction: assertGuardedMutationCurrent,
         });
-        const runToStopForReassignment = await resolveActiveIssueRun(existing);
+        const runToStopForReassignment = await resolveMutationRun();
         if (runToStopForReassignment) {
+          await assertGuardedMutationCurrent();
           const cancelled = await heartbeat.cancelRun(
             runToStopForReassignment.id,
             "Cancelled before issue reassignment",
@@ -13523,15 +13556,19 @@ export function issueRoutes(
         terminalizingIssue &&
         existing.assigneeAgentId
       ) {
+        await assertGuardedMutationCurrent();
         const goalStopAction = await stopRunnerGoalForOwnershipChange({
           companyId: existing.companyId,
           issueId: existing.id,
           agentId: existing.assigneeAgentId,
+          observedProjection: observedGoalProjection,
+          beforeAction: assertGuardedMutationCurrent,
         });
         const runToStopForTerminalization = goalStopAction
-          ? await resolveActiveIssueRun(existing)
+          ? await resolveMutationRun()
           : null;
         if (goalStopAction && runToStopForTerminalization) {
+          await assertGuardedMutationCurrent();
           const cancelled = await heartbeat.cancelRun(
             runToStopForTerminalization.id,
             "Cancelled before issue terminalization",

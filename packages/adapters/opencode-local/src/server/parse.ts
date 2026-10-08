@@ -40,6 +40,8 @@ export function parseOpenCodeJsonl(stdout: string) {
   let invalidUsage = false;
   let invalidCost = false;
   let invalidStream = false;
+  let providerRejected = false;
+  let toolCalls = 0;
 
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -89,6 +91,7 @@ export function parseOpenCodeJsonl(stdout: string) {
     }
 
     if (type === "tool_use") {
+      toolCalls++;
       const part = parseObject(event.part);
       const state = parseObject(part.state);
       if (asString(state.status, "") === "error") {
@@ -99,6 +102,9 @@ export function parseOpenCodeJsonl(stdout: string) {
     }
 
     if (type === "error") {
+      const error = parseObject(event.error);
+      const data = parseObject(error.data);
+      if (error.name === "APICallError" && [401, 403, 429, 502, 503, 504].includes(data.statusCode as number)) providerRejected = true;
       const text = errorText(event.error ?? event.message).trim();
       if (text) errors.push(text);
       continue;
@@ -112,6 +118,7 @@ export function parseOpenCodeJsonl(stdout: string) {
     costUsd: finishedSteps > 0 && !invalidCost && !invalidStream ? costUsd : null,
     errorMessage: errors.length > 0 ? errors.join("\n") : null,
     toolErrors,
+    providerBootstrapUnavailable: providerRejected && !invalidStream && toolCalls === 0 && messages.length === 0 && finishedSteps === 0,
   };
 }
 

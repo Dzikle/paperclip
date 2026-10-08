@@ -11,6 +11,7 @@ export type RetryReasonKind =
   | "disposition_repair"
   | "native_safe_replacement"
   | "ai_connection_wait"
+  | "provider_fallback"
   | "other";
 
 export type BudgetBlockFacts = {
@@ -372,7 +373,7 @@ export function decideScheduledRetryGate(
       details: { issueId: facts.issueId, currentExecutionRunId: facts.issueExecutionRunId, currentCheckoutRunId: facts.issueCheckoutRunId ?? null } };
   }
 
-  const requiresInProgress = facts.retryReasonKind === "max_turn_continuation";
+  const requiresInProgress = facts.retryReasonKind === "max_turn_continuation" || facts.retryReasonKind === "provider_fallback";
   const statusOutcome = decideIssueStatus({
     status: facts.issueStatus,
     requiresInProgress,
@@ -605,7 +606,7 @@ export function decideQueuedRunStaleness(
       details: { issueId: facts.issueId, currentExecutionRunId: facts.issueExecutionRunId, currentCheckoutRunId: facts.issueCheckoutRunId ?? null } };
   }
 
-  const requiresInProgress = facts.retryReasonKind === "max_turn_continuation";
+  const requiresInProgress = facts.retryReasonKind === "max_turn_continuation" || facts.retryReasonKind === "provider_fallback";
   const statusOutcome = decideIssueStatus({
     status: facts.issueStatus,
     requiresInProgress,

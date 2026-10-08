@@ -6,6 +6,7 @@ import { executionProjectionsForRuns } from "./execution-projection.js";
 import type { ExecutionProjection } from "@paperclipai/shared";
 import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import {
   and,
   asc,
@@ -10823,10 +10824,12 @@ export function issueService(db: Db) {
           projectGoalId: nextProjectGoalId,
           defaultGoalId: defaultCompanyGoal?.id ?? null,
         });
-        // Ownership changes invalidate observed handoff versions even if status
-        // stays the same, including an A -> B -> A assignment race.
+        // Ownership, project and policy changes invalidate observed handoff
+        // versions even when status stays the same.
         if ((issueData.assigneeAgentId !== undefined && issueData.assigneeAgentId !== receiptExisting.assigneeAgentId)
-          || (issueData.assigneeUserId !== undefined && issueData.assigneeUserId !== receiptExisting.assigneeUserId)) {
+          || (issueData.assigneeUserId !== undefined && issueData.assigneeUserId !== receiptExisting.assigneeUserId)
+          || (issueData.projectId !== undefined && issueData.projectId !== receiptExisting.projectId)
+          || (issueData.executionPolicy !== undefined && !isDeepStrictEqual(issueData.executionPolicy, receiptExisting.executionPolicy))) {
           patch.statusVersion = sql`${issues.statusVersion} + 1` as unknown as number;
         }
         // Reasserting Blocked or changing its blockers is a fresh decision even

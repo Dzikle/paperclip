@@ -127,6 +127,7 @@ function classifyRetryReasonKind(retryReason: string | null): RetryReasonKind {
   if (retryReason === ISSUE_DISPOSITION_REPAIR_RETRY_REASON) return "disposition_repair";
   if (retryReason === "ai_connection_busy") return "ai_connection_wait";
   if (retryReason === "native_safe_replacement") return "native_safe_replacement";
+  if (retryReason === "provider_fallback") return "provider_fallback";
   return "other";
 }
 
@@ -287,7 +288,7 @@ export function createPostgresRunDispatchAdapter(
       runAgentId: input.agentId,
       issueId,
       retryReasonKind,
-      enforceIssueExecutionLock: retryReasonKind === "max_turn_continuation" || retryReasonKind === "ai_connection_wait",
+      enforceIssueExecutionLock: retryReasonKind === "max_turn_continuation" || retryReasonKind === "ai_connection_wait" || retryReasonKind === "provider_fallback",
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, input.contextSnapshot),
       budgetBlock: null,
       agentInvokable: true,
@@ -779,7 +780,8 @@ export function createPostgresRunDispatchAdapter(
         !gate.allowed &&
         gate.errorCode === "issue_not_found" &&
         factsResult.facts.retryReasonKind !== "max_turn_continuation" &&
-        factsResult.facts.retryReasonKind !== "native_safe_replacement";
+        factsResult.facts.retryReasonKind !== "native_safe_replacement" &&
+        factsResult.facts.retryReasonKind !== "provider_fallback";
 
       if (!gate.allowed && !isLegacyMissingIssueException) {
         const cancelled = await cancelSuppressedRetryInTx(tx as unknown as Db, {

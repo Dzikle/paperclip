@@ -2,6 +2,16 @@ import { describe, expect, it } from "vitest";
 import { parseOpenCodeJsonl, isOpenCodeUnknownSessionError } from "./parse.js";
 
 describe("parseOpenCodeJsonl", () => {
+  it("certifies a typed provider rejection only before any text, tools or completed step", () => {
+    const rejection = JSON.stringify({ type: "error", error: { name: "APICallError", data: { statusCode: 403, message: "Provider denied access" } } });
+    expect(parseOpenCodeJsonl(rejection).providerBootstrapUnavailable).toBe(true);
+    for (const prefix of ["malformed", JSON.stringify({type:"text",part:{text:"Started"}}),
+      JSON.stringify({type:"tool_use",part:{state:{status:"completed"}}}),
+      JSON.stringify({type:"step_finish",part:{}})]) {
+      expect(parseOpenCodeJsonl(prefix + "\n" + rejection).providerBootstrapUnavailable).toBe(false);
+    }
+    expect(parseOpenCodeJsonl(JSON.stringify({type:"error",error:{message:"403 in a tool"}})).providerBootstrapUnavailable).toBe(false);
+  });
   it("parses assistant text, usage, cost, and errors", () => {
     const stdout = [
       JSON.stringify({

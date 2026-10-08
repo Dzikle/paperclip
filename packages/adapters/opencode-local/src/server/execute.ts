@@ -732,7 +732,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // Forward the transport-level error code from the run-disposition seam.
         // A lost duplex control channel surfaces the typed `duplex_channel_lost`
         // code; every other result carries no code here.
-        errorCode: attempt.proc.errorCode ?? null,
+        errorCode: attempt.proc.errorCode ?? (attempt.parsed.providerBootstrapUnavailable ? "provider_unavailable_bootstrap" : null),
+        ...(attempt.parsed.providerBootstrapUnavailable
+          ? { executionRecovery: { kind: "bootstrap" as const, providerWorkStarted: false } } : {}),
         ...(attempt.parsed.usage
           ? { usage: attempt.parsed.usage, usageBasis: "per_run" as const }
           : {}),
