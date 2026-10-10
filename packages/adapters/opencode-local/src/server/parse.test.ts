@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 import { parseOpenCodeJsonl, isOpenCodeUnknownSessionError } from "./parse.js";
 
 describe("parseOpenCodeJsonl", () => {
-  it("certifies a typed provider rejection only before any text, tools or completed step", () => {
-    const rejection = JSON.stringify({ type: "error", error: { name: "APICallError", data: { statusCode: 403, message: "Provider denied access" } } });
+  it.each(["APICallError", "APIError"])("certifies %s provider rejection only before any work", (name) => {
+    const rejection = JSON.stringify({ type: "error", error: { name, data: {
+      statusCode: 403, message: "Provider denied access", isRetryable: false,
+      responseHeaders: {}, responseBody: "Provider denied access", metadata: {},
+    } } });
     expect(parseOpenCodeJsonl(rejection).providerBootstrapUnavailable).toBe(true);
     for (const prefix of ["malformed", JSON.stringify({type:"text",part:{text:"Started"}}),
       JSON.stringify({type:"tool_use",part:{state:{status:"completed"}}}),
@@ -11,6 +14,7 @@ describe("parseOpenCodeJsonl", () => {
       expect(parseOpenCodeJsonl(prefix + "\n" + rejection).providerBootstrapUnavailable).toBe(false);
     }
     expect(parseOpenCodeJsonl(JSON.stringify({type:"error",error:{message:"403 in a tool"}})).providerBootstrapUnavailable).toBe(false);
+    expect(parseOpenCodeJsonl(JSON.stringify({type:"error",error:{name,data:{statusCode:400}}})).providerBootstrapUnavailable).toBe(false);
   });
   it("parses assistant text, usage, cost, and errors", () => {
     const stdout = [

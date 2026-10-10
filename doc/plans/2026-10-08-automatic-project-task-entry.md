@@ -43,6 +43,10 @@ enough. It is prior execution evidence, not a fresh inference probe or guarantee
 that authentication is still valid. A switch is allowed only for a typed
 OpenCode API rejection before text, tools or completed inference steps. Other
 failures and uncertain execution ownership do not authorize a second writer.
+Admitted bootstrap events include both `APICallError` and `APIError` with a
+numeric allowed HTTP status. The latter was reproduced by the live OpenCode
+1.18.35 native canary; message text alone remains insufficient. Both spellings
+share the same no-text/no-tool/no-completed-step checks.
 
 The existing bounded scheduled retry transaction checks task ownership and
 execution lock, deduplicates a predecessor's successor, and stores a one-switch

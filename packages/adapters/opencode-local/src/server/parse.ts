@@ -104,7 +104,7 @@ export function parseOpenCodeJsonl(stdout: string) {
     if (type === "error") {
       const error = parseObject(event.error);
       const data = parseObject(error.data);
-      if (error.name === "APICallError" && [401, 403, 429, 502, 503, 504].includes(data.statusCode as number)) providerRejected = true;
+      if (["APICallError", "APIError"].includes(asString(error.name, "")) && [401, 403, 429, 502, 503, 504].includes(data.statusCode as number)) providerRejected = true;
       const text = errorText(event.error ?? event.message).trim();
       if (text) errors.push(text);
       continue;
