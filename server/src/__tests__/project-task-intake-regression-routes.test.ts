@@ -386,6 +386,9 @@ describeEmbeddedPostgres("project task intake and issue update version routes", 
     const [completed] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,successors[0].id));
     expect(completed.status).toBe("succeeded");
     expect(completed.runnerProfileJson?.adapterDispatch).toEqual({adapterType:"codex_local"});
+    // Direct native harnesses use runtimeMode legacy. Their initialization
+    // must retain the sealed receipt, not just the claimed adapter identity.
+    expect(completed.runnerProfileJson?.providerFallback).toEqual(successors[0].runnerProfileJson?.providerFallback);
     const [principal] = await db.select().from(agents).where(eq(agents.id,agentId));
     expect(principal.adapterType).toBe("opencode_local");
   },30_000);

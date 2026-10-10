@@ -64,6 +64,14 @@ sessions start fresh; primary model overrides do not overwrite fallback selectio
 `codex_local`/`opencode_local` remain direct native harness adapters, not
 `paperclip_runner` runtime mode. Missing cost stays unknown/partial.
 
+Direct-harness (`legacy` runtime mode) initialization must preserve the sealed
+`providerFallback` receipt alongside admission and claimed-adapter evidence in
+its atomic JSONB projection. The live no-tool replay returned the exact Codex
+assistant sentinel but exposed a dropped receipt in this projection. The real
+database regression now verifies that the completed successor retains the
+entire scheduled receipt, not only its `adapterDispatch` identity. A successful
+provider response alone is not a passing durability or one-switch proof.
+
 ## Verification
 
 Disposable Linux PostgreSQL tests exercise actual routes, locks, native retry

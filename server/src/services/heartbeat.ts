@@ -23843,6 +23843,9 @@ export function heartbeatService(
                 else '{}'::jsonb end)
               || (case when ${heartbeatRuns.runnerProfileJson} ? 'adapterDispatch'
                 then jsonb_build_object('adapterDispatch', ${heartbeatRuns.runnerProfileJson}->'adapterDispatch')
+                else '{}'::jsonb end)
+              || (case when ${heartbeatRuns.runnerProfileJson} ? 'providerFallback'
+                then jsonb_build_object('providerFallback', ${heartbeatRuns.runnerProfileJson}->'providerFallback')
                 else '{}'::jsonb end) || ${JSON.stringify(providerTraceRequested ? { providerTrace: { mode: "raw", traceId: providerTraceCapture?.metadata.id ?? null, maxBytes: PROVIDER_TRACE_MAX_BYTES } } : {})}::jsonb`,
               updatedAt: new Date(),
             })
