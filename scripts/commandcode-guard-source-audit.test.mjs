@@ -4,7 +4,6 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
-import { pathToFileURL } from "node:url";
 
 let audit, functions, parser;
 const bundlePath = process.env.AIF_COMMANDCODE_AUDIT_BUNDLE;
@@ -13,7 +12,7 @@ before(async () => {
   await assert.doesNotReject(async () => { audit = await import("./commandcode-guard-source-audit.mjs"); },
     "the approved pinned-source audit module must exist");
   functions = await audit.readPinnedFunctions({ bundlePath, parserPath });
-  parser = await import(pathToFileURL(parserPath).href);
+  parser = functions.parser;
 });
 
 test("extracts only the two pinned functions with exact provenance", () => {
@@ -43,6 +42,18 @@ test("refuses a substituted parser before importing its code", async () => {
     const altered = path.join(root, "parser.mjs");
     await fs.writeFile(altered, "throw new Error('must not execute parser');");
     await assert.rejects(audit.readPinnedFunctions({ bundlePath, parserPath: altered }), /native_audit_parser_mismatch/);
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+test("reuses verified parser bytes after the original parser path is replaced", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "commandcode-audit-"));
+  try {
+    const original = path.join(root, "parser.mjs");
+    await fs.copyFile(parserPath, original);
+    const snapshot = await audit.readPinnedFunctions({ bundlePath, parserPath: original });
+    await fs.writeFile(original, "globalThis.__commandcodeUnverifiedParserExecuted = true; throw new Error('replacement executed');");
+    assert.doesNotThrow(() => audit.extractNamedFunctions(
+      "function createModHost() {} function anchorPathPattern() {}", snapshot.parser));
+    assert.equal(globalThis.__commandcodeUnverifiedParserExecuted, undefined);
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 function newHost() { return audit.createOfflineModHost(functions.get("createModHost")); }

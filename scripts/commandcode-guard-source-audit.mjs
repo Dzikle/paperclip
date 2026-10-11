@@ -52,6 +52,9 @@ export async function readPinnedFunctions({ bundlePath, parserPath }) {
   const parser = await import("data:text/javascript;base64," + parserBytes.toString("base64"));
   if (parser.version !== "8.18.0") throw new Error("native_audit_parser_mismatch");
   const functions = extractNamedFunctions(bundle.toString("utf8"), parser);
+  // Synthetic extraction checks must reuse this verified module, never reopen
+  // the original parser path after verification.
+  functions.parser = parser;
   functions.provenance = { bundleSha256: BUNDLE_SHA, parserSha256: PARSER_SHA,
     parserVersion: parser.version, ...functions.provenance };
   return functions;
