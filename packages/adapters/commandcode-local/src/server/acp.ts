@@ -1,0 +1,79 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import { assertNativeLocalLaunch, buildNativeAcpConfig, executeNativeAcp, nativeAbsolutePath, nativeText, type NativeAcpExecutorOptions } from "@paperclipai/adapter-utils/native-provider-adapter";
+import { NativeProviderError } from "@paperclipai/adapter-utils/native-provider-contract";
+
+export function buildCommandCodeAcpConfig(config: Record<string, unknown>): Record<string, unknown> {
+  const next = buildNativeAcpConfig(config, " acp");
+  const env = next.env as Record<string, string>;
+  for (const [key, value] of Object.entries({ COMMANDCODE_SKIP_UPDATES: "1", DO_NOT_TRACK: "1" })) {
+    if (env[key] !== undefined && env[key] !== value) throw new Error("native_startup_env_conflict");
+    env[key] = value;
+  }
+  return next;
+}
+function stable(value: unknown): string {
+  if (Array.isArray(value)) return "[" + value.map(stable).join(",") + "]";
+  if (value && typeof value === "object") return "{" + Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => JSON.stringify(key) + ":" + stable(item)).join(",") + "}";
+  return JSON.stringify(value);
+}
+async function readManagedJson(file: string): Promise<{ value: unknown; digest: string }> {
+  const stat = await fs.lstat(file);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 32_768) throw new NativeProviderError("native_permission_unsupported");
+  const bytes = await fs.readFile(file);
+  return { value: JSON.parse(bytes.toString("utf8")), digest: createHash("sha256").update(bytes).digest("hex") };
+}
+/** Refuse unknown settings rather than trusting native backend-over-client MCP precedence.
+ * No credentials are read or changed. Actual pinned-CLI enforcement is a separate
+ * capability qualification gate; this is not a host isolation boundary. */
+export async function assertCommandCodePolicy(config: Record<string, unknown>): Promise<void> {
+  const home = nativeAbsolutePath(config.nativeHome), cwd = nativeAbsolutePath(config.cwd);
+  const directory = path.join(home, ".commandcode");
+  if (await fs.realpath(directory) !== directory) throw new NativeProviderError("native_mcp_identity_mismatch");
+  for (const entry of await fs.readdir(directory)) {
+    if (!["auth.json", "settings.json", "config.json", "telemetry-install-id"].includes(entry)) throw new NativeProviderError("native_mcp_identity_mismatch");
+  }
+  for (const name of [".commandcode", ".mcp.json"]) {
+    const exists = await fs.lstat(path.join(cwd, name)).then(() => true).catch(error => { if (error.code === "ENOENT") return false; throw error; });
+    if (exists) throw new NativeProviderError("native_mcp_identity_mismatch");
+  }
+  const policy = config.nativePolicy as { permissions?: Record<string, unknown> } | undefined;
+  const permissions = policy?.permissions;
+  if (!policy || Object.keys(policy).join() !== "permissions" || !permissions
+      || Object.keys(permissions).sort().join() !== "allow,defaultMode,deny,disableBypass"
+      || permissions.defaultMode !== "dont-ask" || permissions.disableBypass !== true
+      || !Array.isArray(permissions.allow) || !Array.isArray(permissions.deny)
+      || [...permissions.allow, ...permissions.deny].some(rule => typeof rule !== "string" || rule.length > 1024 || /[\0\r\n]/.test(rule))
+      || permissions.allow.length > 64 || permissions.deny.length > 64) throw new NativeProviderError("native_permission_unsupported");
+  if (config.permissionMode === "deny-all") {
+    if (permissions.allow.length || stable(permissions.deny) !== '["*"]') throw new NativeProviderError("native_permission_unsupported");
+  } else {
+    const requiredDenies = ["Bash(git push:*)", "Bash(gh:*)", "task", "ask_user", `Read(${home}/**)`, `Write(${home}/**)`, `Edit(${home}/**)`];
+    const deny = permissions.deny as string[];
+    if (!permissions.allow.length || requiredDenies.some(rule => !deny.includes(rule))) throw new NativeProviderError("native_permission_unsupported");
+  }
+  const settings = await readManagedJson(path.join(directory, "settings.json"));
+  if (settings.digest !== config.nativeSettingsDigest || stable(settings.value) !== stable({ model: nativeText(config.model), ...policy })) throw new NativeProviderError("native_permission_unsupported");
+  // Native provider selection must be explicit; forbid hooks, plugins, BYOK
+  // endpoints and feature-model overrides from this low-precedence source.
+  const preferences = await readManagedJson(path.join(directory, "config.json"));
+  const expected = { model: nativeText(config.model), provider: nativeText(config.provider), tasteLearning: false, ideContextEnabled: false, autoInstallExtension: false };
+  if (stable(preferences.value) !== stable(expected)) throw new NativeProviderError("native_permission_unsupported");
+}
+export function createCommandCodeAcpExecutor(options: NativeAcpExecutorOptions = {}) {
+  let execute: ((ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>) | undefined;
+  return async (ctx: AdapterExecutionContext) => executeNativeAcp(ctx, async protectedCtx => {
+    const config = buildCommandCodeAcpConfig(ctx.config);
+    await assertNativeLocalLaunch({ ...protectedCtx, config });
+    await assertCommandCodePolicy(config);
+    if (!execute) {
+      const { createAcpxEngineExecutor } = await import("@paperclipai/adapter-utils/acpx-engine/execute");
+      const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+      execute = createAcpxEngineExecutor({ ...options, adapterType: "commandcode_local", moduleDir, packageRootDir: path.resolve(moduleDir, "../.."), requireModelIdentity: true, customSkillsMode: "prompt" });
+    }
+    return execute({ ...protectedCtx, config });
+  });
+}

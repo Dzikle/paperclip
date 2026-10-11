@@ -31,6 +31,7 @@ COPY packages/tailscale-https-broker/package.json packages/tailscale-https-broke
 COPY packages/teams-catalog/package.json packages/teams-catalog/
 COPY packages/adapters/claude-local/package.json packages/adapters/claude-local/
 COPY packages/adapters/cline-local/package.json packages/adapters/cline-local/
+COPY packages/adapters/commandcode-local/package.json packages/adapters/commandcode-local/
 COPY packages/adapters/codex-local/package.json packages/adapters/codex-local/
 COPY packages/adapters/cursor-cloud/package.json packages/adapters/cursor-cloud/
 COPY packages/adapters/cursor-local/package.json packages/adapters/cursor-local/
