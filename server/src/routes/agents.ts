@@ -1,4 +1,7 @@
 import { resolveAgentAppearance, agentAvatarUrl } from "@paperclipai/shared";
+import { assertNativeOwner, validateNativeMetadataUpdate } from "../services/native-profile-admission-store.js";
+import { assertNativeDispatchAdmission, type NativeAdmission } from "../services/native-profile-admission.js";
+import { resolveNativeBinding } from "../services/native-profile-binding.js";
 import { listOpenRouterModels } from "../services/openrouter-models.js";
 import { prepareManagedAiRuntime, assertManagedAiProjectAuth, stripAiAuthBindings } from "../services/ai-connection-runtime.js";
 import { ADAPTER_AUTH_MISSING_CHECK_CODE, AI_CONNECTION_CAPABILITIES, aiConnectionBindingSchema, type AiConnectionBinding } from "@paperclipai/shared";
@@ -526,6 +529,15 @@ export function agentRoutes(
   const KNOWN_INSTRUCTIONS_BUNDLE_KEY_SET: ReadonlySet<string> = new Set(KNOWN_INSTRUCTIONS_BUNDLE_KEYS);
 
   const router = Router();
+  router.use((req, _res, next) => {
+    // Create/hire cannot smuggle a pre-granted admission or proof scope. First
+    // create the idle agent, then use the evidence-validated owner PATCH.
+    const metadata = asRecord(req.body?.metadata);
+    if (req.method === "POST" && metadata && (metadata.nativeProviderAdmission !== undefined || metadata.nativeProviderQualification !== undefined || metadata.nativeProviderManaged !== undefined)) {
+      next(unprocessable("native_owner_patch_required")); return;
+    }
+    next();
+  });
   const svc = agentService(db);
   const access = accessService(db);
   const approvalsSvc = approvalService(db);
@@ -5186,6 +5198,20 @@ export function agentRoutes(
     res.json(result.bundle);
   });
 
+  router.get("/agents/:id/native-provider-admission", async (req, res) => {
+    const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Agent not found");
+    if (!existing) return;
+    if (typeof req.query.projectId !== "string" || !isUuidLike(req.query.projectId)) throw unprocessable("native_project_mismatch");
+    res.setHeader("Cache-Control", "no-store");
+    try {
+      const currentBinding = await resolveNativeBinding(db, existing, existing.adapterConfig, req.query.projectId);
+      const admission = asRecord(existing.metadata)?.nativeProviderAdmission as NativeAdmission ?? null;
+      let admitted = false;
+      try { assertNativeDispatchAdmission({ currentBinding, admission }); admitted = true; } catch { /* closed unavailable response */ }
+      res.json({ schemaVersion: 1, currentBinding, admission, admitted });
+    } catch { res.json({ schemaVersion: 1, currentBinding: null, admission: null, admitted: false, reason: "native_binding_unverified" }); }
+  });
+
   router.patch("/agents/:id", validate(updateAgentSchema), async (req, res) => {
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
@@ -5360,6 +5386,7 @@ export function agentRoutes(
       await assertCanUpdateAgent(req, existing);
     }
 
+    await validateNativeMetadataUpdate(db, req.actor, existing, patchData);
     const actor = getActorInfo(req);
     const agent = await svc.update(id, patchData, {
       recordRevision: {

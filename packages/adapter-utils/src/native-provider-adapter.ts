@@ -17,7 +17,7 @@ export function nativeAbsolutePath(value: unknown): string {
   if (!result.startsWith("/") || result.includes("\\") || path.posix.normalize(result) !== result || result === "/" || result.endsWith("/")) throw new Error("native_command_invalid");
   return result;
 }
-export function buildNativeAcpConfig(config: Record<string, unknown>, suffix: " --acp" | " acp"): Record<string, unknown> {
+export function buildNativeAcpConfig(config: Record<string, unknown>, suffix: " --acp" | " acp", controllerEnv: Record<string, unknown> = {}): Record<string, unknown> {
   for (const key of ["agentCommand", "acpAgentCommand", "engine", "args", "extraArgs", "autoApprove", "dangerouslySkipPermissions", "dangerouslyBypassSandbox", "effort", "thinkingEffort", "fastMode", "acpPermissionMode", "acpMode", "acpStateDir", "acpWarmHandleIdleMs"]) {
     if (config[key] !== undefined) throw new Error("native_control_unsupported");
   }
@@ -30,7 +30,8 @@ export function buildNativeAcpConfig(config: Record<string, unknown>, suffix: " 
   const env: Record<string, string> = {};
   if (config.env !== undefined && (!config.env || typeof config.env !== "object" || Array.isArray(config.env))) throw new Error("native_env_invalid");
   for (const [key, value] of Object.entries(config.env as Record<string, unknown> ?? {})) {
-    if (!/^[A-Z][A-Z0-9_]*$/.test(key) || /^(PAPERCLIP_|GITHUB_|GIT_|GH_TOKEN$|NODE_OPTIONS$|LD_|DYLD_|BASH_ENV$|ENV$|USERPROFILE$)/.test(key)
+    const governed = /^(PAPERCLIP_|GITHUB_|GIT_|GH_TOKEN$)/.test(key) && controllerEnv[key] === value;
+    if (!/^[A-Z][A-Z0-9_]*$/.test(key) || (!governed && /^(PAPERCLIP_|GITHUB_|GIT_|GH_TOKEN$)/.test(key)) || /^(NODE_OPTIONS$|LD_|DYLD_|BASH_ENV$|ENV$|USERPROFILE$)/.test(key)
         || typeof value !== "string" || /[\0\r\n]/.test(value)) throw new Error("native_env_invalid");
     env[key] = value;
   }

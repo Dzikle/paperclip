@@ -64,6 +64,7 @@ import {
 import {
   claudeModelUsageTotals,
   parseClaudeStreamJson,
+  claudeNativeModelIdentity,
   describeClaudeFailure,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
@@ -1224,6 +1225,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : null;
     const mergedResultJson: Record<string, unknown> = {
       ...parsed,
+      nativeModelIdentity: claudeNativeModelIdentity(parsedStream),
       ...(failed && clearSessionForMaxTurns ? { stopReason: "max_turns_exhausted" } : {}),
       ...(failed && poisonedPreviousMessageId ? { stopReason: "claude_poisoned_previous_message_id" } : {}),
       ...(claudeRefusal ? { stopReason: "refusal", errorFamily: "model_refusal" } : {}),

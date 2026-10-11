@@ -1,4 +1,5 @@
 import type { UsageSummary } from "@paperclipai/adapter-utils";
+import type { NativeModelIdentity } from "@paperclipai/adapter-utils/native-provider-contract";
 import {
   asString,
   asNumber,
@@ -59,6 +60,7 @@ export function parseClaudeStreamJson(stdout: string) {
   let model = "";
   let finalResult: Record<string, unknown> | null = null;
   const assistantTexts: string[] = [];
+  const responseModels = new Set<string>();
 
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -76,6 +78,8 @@ export function parseClaudeStreamJson(stdout: string) {
     if (type === "assistant") {
       sessionId = asString(event.session_id, sessionId ?? "") || sessionId;
       const message = parseObject(event.message);
+      const responseModel = asString(message.model, "").trim();
+      if (responseModel) responseModels.add(responseModel);
       const content = Array.isArray(message.content) ? message.content : [];
       for (const entry of content) {
         if (typeof entry !== "object" || entry === null || Array.isArray(entry)) continue;
@@ -103,6 +107,7 @@ export function parseClaudeStreamJson(stdout: string) {
       usageBasis: null as "per_run" | null,
       summary: assistantTexts.join("\n\n").trim(),
       resultJson: null as Record<string, unknown> | null,
+      nativeResponseModels: [...responseModels],
     };
   }
 
@@ -120,6 +125,7 @@ export function parseClaudeStreamJson(stdout: string) {
   return {
     sessionId,
     model,
+    nativeResponseModels: [...responseModels],
     costUsd,
     usage,
     // modelUsage covers exactly this CLI invocation, so mark it per-run to
@@ -128,6 +134,10 @@ export function parseClaudeStreamJson(stdout: string) {
     summary,
     resultJson: finalResult,
   };
+}
+
+export function claudeNativeModelIdentity(parsed: { nativeResponseModels: string[] }): NativeModelIdentity | null {
+  return parsed.nativeResponseModels.length === 1 ? { model: parsed.nativeResponseModels[0], source: "native_response" } : null;
 }
 
 function extractClaudeErrorMessages(parsed: Record<string, unknown>): string[] {

@@ -2,8 +2,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { assertNativeLocalLaunch, buildNativeAcpConfig, executeNativeAcp, nativeText, type NativeAcpExecutorOptions } from "@paperclipai/adapter-utils/native-provider-adapter";
-export function buildClineAcpConfig(config: Record<string, unknown>): Record<string, unknown> {
-  const next = buildNativeAcpConfig(config, " --acp");
+export function buildClineAcpConfig(config: Record<string, unknown>, controllerEnv: Record<string, unknown> = {}): Record<string, unknown> {
+  const next = buildNativeAcpConfig(config, " --acp", controllerEnv);
   const provider = nativeText(config.provider);
   const env = next.env as Record<string, string>;
   for (const [key, value] of Object.entries({ CLINE_PROVIDER: provider, CLINE_MODEL: next.model as string })) {
@@ -15,7 +15,7 @@ export function buildClineAcpConfig(config: Record<string, unknown>): Record<str
 export function createClineAcpExecutor(options: NativeAcpExecutorOptions = {}) {
   let execute: ((ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>) | undefined;
   return async (ctx: AdapterExecutionContext) => executeNativeAcp(ctx, async protectedCtx => {
-    const config = buildClineAcpConfig(ctx.config);
+    const config = buildClineAcpConfig(ctx.config, protectedCtx.context.nativeControllerEnv as Record<string, unknown> ?? {});
     await assertNativeLocalLaunch({ ...protectedCtx, config });
     if (!execute) {
       const { createAcpxEngineExecutor } = await import("@paperclipai/adapter-utils/acpx-engine/execute");

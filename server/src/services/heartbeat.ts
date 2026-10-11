@@ -1,4 +1,5 @@
 import { publicChatTaskUrl } from "./chat-task-url.js";
+import { authorizeNativeDispatch, nativeQualificationOverlay, recordNativeDispatchResult, type NativeDispatchProof } from "./native-profile-admission-store.js";
 import { hasProviderFallback, providerFallbackRuntime, type ProviderFallbackReceipt } from "./provider-fallback-runtime.js";
 import { isDeepStrictEqual } from "node:util";
 import { toolActionDeliveryService } from "./tool-action-delivery.js";
@@ -20284,6 +20285,10 @@ export function heartbeatService(
       // Never adopt a chat-execution attestation supplied in a wake payload.
       // Reviewed chat turns rebuild it from the current durable owner below.
       delete context[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY];
+      // Wake/issue/plugin context is never authority for native qualification.
+      delete context.nativeQualificationPhase;
+      delete context.nativeControllerEnv;
+      delete context.nativeProviderProof;
       delete context[EXTERNAL_CHAT_QUESTION_RESPONSE_KEY];
       const providerTraceRequested =
         parseObject(context.debug).providerTrace === "raw";
@@ -24115,10 +24120,22 @@ export function heartbeatService(
         };
 
         let adapterResult: AdapterExecutionResult;
+        let nativeDispatchProof: NativeDispatchProof | null = null;
+        let nativeDispatchBaseConfig: Record<string, unknown> | null = null;
+        let nativeQualificationBasePolicy: Record<string, unknown> | null = null;
         const runGoalControlRequestId = readNonEmptyString(
           context.goalControlRequestId,
         );
         try {
+          nativeDispatchProof = await authorizeNativeDispatch(db, { agent, config: runtimeConfig, issueId: issueRef?.id ?? null, projectId: issueRef?.projectId ?? null, runId: run.id, runtimeSkills: runtimeSkillEntries });
+          if (nativeDispatchProof) {
+            nativeDispatchBaseConfig = { ...runtimeConfig };
+            if (nativeDispatchProof.phase === "capabilities" || nativeDispatchProof.phase === "availability") nativeQualificationBasePolicy = {
+              permissionMode: runtimeConfig.permissionMode, nativePolicy: runtimeConfig.nativePolicy, nativeSettingsDigest: runtimeConfig.nativeSettingsDigest,
+            };
+            runtimeConfig = nativeQualificationOverlay(runtimeConfig, nativeDispatchProof);
+            if (nativeDispatchProof.phase !== "production") context.nativeQualificationPhase = nativeDispatchProof.phase;
+          }
           if (nativeRuntimeResolution.kind === "native") {
             if (!nativeExecution || !nativeRunnerInstanceId)
               throw new Error("native_runtime_selection_not_persisted");
@@ -24445,6 +24462,14 @@ export function heartbeatService(
                   }
                 : {}),
             };
+            delete adapterContext.nativeQualificationPhase;
+            delete adapterContext.nativeProviderProof;
+            delete adapterContext.nativeQualificationBasePolicy;
+            delete adapterContext.nativeControllerEnv;
+            // Memory-only governed launch values, never caller context or metadata.
+            if (nativeDispatchProof) adapterContext.nativeControllerEnv = { ...parseObject(runtimeConfig.env) };
+            if (nativeQualificationBasePolicy) adapterContext.nativeQualificationBasePolicy = nativeQualificationBasePolicy;
+            if (nativeDispatchProof && nativeDispatchProof.phase !== "production") adapterContext.nativeQualificationPhase = nativeDispatchProof.phase;
             const runtimeToolDelivery =
               adapter.runtimeToolDelivery ?? "invocation_context";
             if (runtimeTools && runtimeToolDelivery === "native_mcp") {
@@ -24473,6 +24498,10 @@ export function heartbeatService(
             });
             if (managedMcpConfig) {
               adapterContext.paperclipManagedMcp = managedMcpConfig;
+            }
+            if (nativeDispatchProof && nativeDispatchBaseConfig) {
+              const rechecked = await authorizeNativeDispatch(db, { agent, config: nativeDispatchBaseConfig, issueId: issueRef?.id ?? null, projectId: issueRef?.projectId ?? null, runId: run.id, runtimeSkills: runtimeSkillEntries });
+              if (!rechecked || rechecked.baseBindingFingerprint !== nativeDispatchProof.baseBindingFingerprint || rechecked.phase !== nativeDispatchProof.phase) throw new Error("native_binding_mismatch");
             }
             const guardedDispatch =
               await dispatchResolvedInteractionContinuationWithAtomicGate(
@@ -24558,6 +24587,7 @@ export function heartbeatService(
             if (!guardedDispatch.dispatched) return;
             adapterResult = await guardedDispatch.resultPromise;
           }
+          adapterResult = await recordNativeDispatchResult(db, agent, run.id, nativeDispatchProof, adapterResult);
           // Adapter returned cleanly, which means its workspace-restore finally
           // block also ran without throwing. Record the workspace_finalize
           // barrier so dependents that share this executionWorkspace can wake.

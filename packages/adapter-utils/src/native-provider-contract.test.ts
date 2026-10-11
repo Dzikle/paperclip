@@ -8,6 +8,10 @@ const binding: NativeBindingIdentity = {
   instructionsDigest: "c".repeat(64), credentialVersionRef: "credential-v1",
 };
 describe("native provider contract", () => {
+  it("matches the fixed Python UTF-8 fingerprint fixture", () => {
+    const crossLanguage = { ...binding, cwd: "/paperclip/source", accountRef: "account-ёж", runtimePin: "fixture@1", credentialVersionRef: "secret-ref:v1" };
+    expect(nativeBindingFingerprint(crossLanguage)).toBe("7fc6460695a311b513165695c1b944429030db8e0476557dc3573f05be9c09a6");
+  });
   it("requires actual exact native model evidence", () => {
     expect(() => requireNativeModelIdentity(undefined, binding.model, "acp_session_status")).toThrow("native_model_identity_missing");
     expect(() => requireNativeModelIdentity("other/model", binding.model, "acp_session_status")).toThrow("native_model_identity_mismatch");

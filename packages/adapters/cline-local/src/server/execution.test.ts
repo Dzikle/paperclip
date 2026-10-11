@@ -29,6 +29,16 @@ async function fixture() {
   return { execute, ctx, runtime, createRuntime, settlements, command, home };
 }
 describe.runIf(process.platform === "linux")("Cline injected runtime integration", () => {
+  it("preserves exact controller-governed launch env without allowing config impersonation", async () => {
+    const f = await fixture();
+    const governed = { PAPERCLIP_RUN_SCRATCH_DIR: "/tmp/proof", PAPERCLIP_GIT_AUTH_MODE: "managed", GIT_TERMINAL_PROMPT: "0" };
+    Object.assign(f.ctx.config, { env: governed });
+    expect((await f.execute(f.ctx as never)).exitCode).not.toBe(0);
+    Object.assign(f.ctx.context, { nativeControllerEnv: governed });
+    expect((await f.execute(f.ctx as never)).exitCode).toBe(0);
+    const options = f.runtime.ensureSession.mock.calls[0]?.[0] as { sessionOptions: { env: Record<string,string> } };
+    expect(options.sessionOptions.env).toMatchObject(governed);
+  });
   it("launches in the isolated home and never inherits owner authority", async () => {
     const f = await fixture();
     const previous = process.env.GITHUB_TOKEN;

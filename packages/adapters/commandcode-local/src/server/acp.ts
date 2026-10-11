@@ -1,13 +1,13 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { assertNativeLocalLaunch, buildNativeAcpConfig, executeNativeAcp, nativeAbsolutePath, nativeText, type NativeAcpExecutorOptions } from "@paperclipai/adapter-utils/native-provider-adapter";
 import { NativeProviderError } from "@paperclipai/adapter-utils/native-provider-contract";
 
-export function buildCommandCodeAcpConfig(config: Record<string, unknown>): Record<string, unknown> {
-  const next = buildNativeAcpConfig(config, " acp");
+export function buildCommandCodeAcpConfig(config: Record<string, unknown>, controllerEnv: Record<string, unknown> = {}): Record<string, unknown> {
+  const next = buildNativeAcpConfig(config, " acp", controllerEnv);
   const env = next.env as Record<string, string>;
   for (const [key, value] of Object.entries({ COMMANDCODE_SKIP_UPDATES: "1", DO_NOT_TRACK: "1" })) {
     if (env[key] !== undefined && env[key] !== value) throw new Error("native_startup_env_conflict");
@@ -66,14 +66,46 @@ export async function assertCommandCodePolicy(config: Record<string, unknown>): 
 export function createCommandCodeAcpExecutor(options: NativeAcpExecutorOptions = {}) {
   let execute: ((ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>) | undefined;
   return async (ctx: AdapterExecutionContext) => executeNativeAcp(ctx, async protectedCtx => {
-    const config = buildCommandCodeAcpConfig(ctx.config);
+    let config = buildCommandCodeAcpConfig(ctx.config, protectedCtx.context.nativeControllerEnv as Record<string, unknown> ?? {});
     await assertNativeLocalLaunch({ ...protectedCtx, config });
+    const phase = protectedCtx.context.nativeQualificationPhase;
+    let restore: (() => Promise<void>) | undefined;
+    if (phase === "capabilities" || phase === "availability") {
+      const base = protectedCtx.context.nativeQualificationBasePolicy;
+      if (!base || typeof base !== "object" || Array.isArray(base)) throw new NativeProviderError("native_permission_unsupported");
+      await assertCommandCodePolicy({ ...config, ...base });
+      const settingsPath = path.join(String(config.nativeHome), ".commandcode/settings.json");
+      const original = await fs.readFile(settingsPath);
+      const backupDir = path.join(String(config.nativeHome), ".aif-native-policy");
+      await fs.mkdir(backupDir, { recursive: true, mode: 0o700 });
+      if (await fs.realpath(backupDir) !== backupDir) throw new NativeProviderError("native_permission_unsupported");
+      const backup = path.join(backupDir, randomUUID() + ".json");
+      await fs.writeFile(backup, original, { flag: "wx", mode: 0o600 });
+      // Backup survives a controller crash; unknown edits are never overwritten.
+      const probe = Buffer.from(JSON.stringify({ model: config.model, permissions: { defaultMode: "dont-ask", deny: ["*"], allow: [], disableBypass: true } }));
+      const probeDigest = createHash("sha256").update(probe).digest("hex");
+      const swap = async (bytes: Buffer) => {
+        const temporary = settingsPath + ".aif-" + randomUUID();
+        try { await fs.writeFile(temporary, bytes, { flag: "wx", mode: 0o600 }); await fs.rename(temporary, settingsPath); }
+        catch (error) { await fs.unlink(temporary).catch(() => {}); throw error; }
+      };
+      await swap(probe);
+      restore = async () => {
+        const current = await fs.readFile(settingsPath);
+        if (createHash("sha256").update(current).digest("hex") !== probeDigest) throw new NativeProviderError("native_permission_unsupported");
+        await swap(original);
+        await fs.unlink(backup);
+      };
+      config = { ...config, nativeSettingsDigest: probeDigest };
+    }
+    try {
     await assertCommandCodePolicy(config);
     if (!execute) {
       const { createAcpxEngineExecutor } = await import("@paperclipai/adapter-utils/acpx-engine/execute");
       const moduleDir = path.dirname(fileURLToPath(import.meta.url));
       execute = createAcpxEngineExecutor({ ...options, adapterType: "commandcode_local", moduleDir, packageRootDir: path.resolve(moduleDir, "../.."), requireModelIdentity: true, customSkillsMode: "prompt" });
     }
-    return execute({ ...protectedCtx, config });
+    return await execute({ ...protectedCtx, config });
+    } finally { await restore?.(); }
   });
 }

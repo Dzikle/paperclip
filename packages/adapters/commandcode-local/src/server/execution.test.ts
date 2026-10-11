@@ -69,4 +69,16 @@ describe.runIf(process.platform === "linux")("Command Code injected runtime inte
     expect((await f.execute(f.ctx as never)).errorCode).toBe("native_model_unsupported");
     expect(f.runtime.startTurn).not.toHaveBeenCalled();
   });
+  it("applies the no-tool policy overlay only for the protected qualification scope, then restores managed settings", async () => {
+    const f = await fixture();
+    const basePolicy = { permissions: { defaultMode: "dont-ask", allow: ["Read"], deny: ["Bash(git push:*)", "Bash(gh:*)", "task", "ask_user", `Read(${f.ctx.config.nativeHome}/**)`, `Write(${f.ctx.config.nativeHome}/**)`, `Edit(${f.ctx.config.nativeHome}/**)`], disableBypass: true } };
+    const baseSettings = JSON.stringify({ model: "exact/model", ...basePolicy });
+    await fs.writeFile(path.join(f.ctx.config.nativeHome, ".commandcode/settings.json"), baseSettings);
+    f.ctx.config.nativeSettingsDigest = createHash("sha256").update(baseSettings).digest("hex");
+    Object.assign(f.ctx.context, { nativeQualificationPhase: "capabilities", nativeQualificationBasePolicy: { nativePolicy: basePolicy, permissionMode: "approve-reads", nativeSettingsDigest: f.ctx.config.nativeSettingsDigest } });
+    const result = await f.execute(f.ctx as never);
+    expect(result.exitCode).toBe(0);
+    expect(f.runtime.startTurn).not.toHaveBeenCalled();
+    expect(await fs.readFile(path.join(f.ctx.config.nativeHome, ".commandcode/settings.json"), "utf8")).toBe(baseSettings);
+  });
 });
