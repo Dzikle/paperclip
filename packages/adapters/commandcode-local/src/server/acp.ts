@@ -1,9 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { createHash, randomUUID } from "node:crypto";
-import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
-import { assertNativeLocalLaunch, buildNativeAcpConfig, executeNativeAcp, nativeAbsolutePath, nativeText, type NativeAcpExecutorOptions } from "@paperclipai/adapter-utils/native-provider-adapter";
+import { buildNativeAcpConfig, executeNativeAcp, nativeAbsolutePath, nativeText, type NativeAcpExecutorOptions } from "@paperclipai/adapter-utils/native-provider-adapter";
 import { NativeProviderError } from "@paperclipai/adapter-utils/native-provider-contract";
 
 export function buildCommandCodeAcpConfig(config: Record<string, unknown>, controllerEnv: Record<string, unknown> = {}): Record<string, unknown> {
@@ -64,58 +63,13 @@ export async function assertCommandCodePolicy(config: Record<string, unknown>): 
   if (stable(preferences.value) !== stable(expected)) throw new NativeProviderError("native_permission_unsupported");
 }
 export function createCommandCodeAcpExecutor(options: NativeAcpExecutorOptions = {}) {
-  let execute: ((ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>) | undefined;
-  return async (ctx: AdapterExecutionContext) => executeNativeAcp(ctx, async protectedCtx => {
-    let config = buildCommandCodeAcpConfig(ctx.config, protectedCtx.context.nativeControllerEnv as Record<string, unknown> ?? {});
-    await assertNativeLocalLaunch({ ...protectedCtx, config });
-    const phase = protectedCtx.context.nativeQualificationPhase;
-    let restore: (() => Promise<void>) | undefined;
-    if (phase === "capabilities" || phase === "availability") {
-      const base = protectedCtx.context.nativeQualificationBasePolicy;
-      if (!base || typeof base !== "object" || Array.isArray(base)) throw new NativeProviderError("native_permission_unsupported");
-      await assertCommandCodePolicy({ ...config, ...base });
-      const settingsPath = path.join(String(config.nativeHome), ".commandcode/settings.json");
-      const original = await fs.readFile(settingsPath);
-      const backupDir = path.join(String(config.nativeHome), ".aif-native-policy");
-      await fs.mkdir(backupDir, { recursive: true, mode: 0o700 });
-      if (await fs.realpath(backupDir) !== backupDir) throw new NativeProviderError("native_permission_unsupported");
-      const backup = path.join(backupDir, randomUUID() + ".json");
-      await fs.writeFile(backup, original, { flag: "wx", mode: 0o600 });
-      // Backup survives a controller crash; unknown edits are never overwritten.
-      const probe = Buffer.from(JSON.stringify({ model: config.model, permissions: { defaultMode: "dont-ask", deny: ["*"], allow: [], disableBypass: true } }));
-      const probeDigest = createHash("sha256").update(probe).digest("hex");
-      const swap = async (bytes: Buffer) => {
-        const temporary = settingsPath + ".aif-" + randomUUID();
-        try { await fs.writeFile(temporary, bytes, { flag: "wx", mode: 0o600 }); await fs.rename(temporary, settingsPath); }
-        catch (error) { await fs.unlink(temporary).catch(() => {}); throw error; }
-      };
-      await swap(probe);
-      restore = async () => {
-        const current = await fs.readFile(settingsPath);
-        if (createHash("sha256").update(current).digest("hex") !== probeDigest) throw new NativeProviderError("native_permission_unsupported");
-        await swap(original);
-        await fs.unlink(backup);
-      };
-      config = { ...config, nativeSettingsDigest: probeDigest };
-    }
-    let captured: AdapterExecutionResult | undefined;
-    try {
-    await assertCommandCodePolicy(config);
-    if (!execute) {
-      const { createAcpxEngineExecutor } = await import("@paperclipai/adapter-utils/acpx-engine/execute");
-      const moduleDir = path.dirname(fileURLToPath(import.meta.url));
-      execute = createAcpxEngineExecutor({ ...options, adapterType: "commandcode_local", moduleDir, packageRootDir: path.resolve(moduleDir, "../.."), requireModelIdentity: true, customSkillsMode: "prompt" });
-    }
-    captured = await execute({ ...protectedCtx, config });
-    return captured;
-    } finally {
-      try { await restore?.(); }
-      catch (error) {
-        if (!captured) throw error;
-        // Restoration can fail after billable work. Close the run without
-        // replacing already captured usage, cost or session accounting.
-        return { ...captured, exitCode: 1, errorCode: "native_permission_unsupported", errorMessage: "native_permission_unsupported", clearSession: true };
-      }
-    }
-  });
+  void options;
+  // Required pinned native guard controls are not proven. No phase, owner
+  // boolean, cached receipt or injected runtime bypasses this source gate.
+  return async (ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> => {
+    const result = await executeNativeAcp(ctx, async () => {
+      throw new NativeProviderError("native_permission_unsupported");
+    });
+    return { ...result, clearSession: true };
+  };
 }

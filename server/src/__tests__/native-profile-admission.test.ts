@@ -35,6 +35,12 @@ function fakeDb(current: Record<string, unknown> = agent, rotatedFingerprint = f
   return { db: database as never, writes };
 }
 describe("native admission dispatch/owner integration without external services", () => {
+  it("does not record dispatch proof when the native binding is unsupported", async () => {
+    const f = fakeDb();
+    vi.mocked(resolveNativeBinding).mockRejectedValue(new Error("native_permission_unsupported"));
+    await expect(authorizeNativeDispatch(f.db, { agent: agent as never, config: {}, issueId: id(5), projectId: id(3), runId: id(30), runtimeSkills: [] })).rejects.toThrow("native_permission_unsupported");
+    expect(f.writes).toHaveLength(0);
+  });
   it("rejects coding scope with an oversized base timeout before capturing proof", async () => {
     const scope = { schemaVersion: 1 as const, bindingFingerprint: fingerprint, issueIds: [id(5)], phase: "coding" as const, expiresAt: new Date(Date.now() + 60_000).toISOString(), maxAttempts: 2 as const };
     const scoped = { ...agent, metadata: { ...agent.metadata, nativeProviderQualification: scope } };

@@ -30,69 +30,30 @@ async function fixture() {
       timeoutSec: 2, paperclipRuntimeSkills: [], paperclipSkillSync: { desiredSkills: [] } }, onLog: vi.fn(async () => {}), onMeta: vi.fn(async () => {}) };
   return { ctx, runtime, execute, createRuntime, settlements, root };
 }
-describe.runIf(process.platform === "linux")("Command Code injected runtime integration", () => {
-  it("uses a cold process per project and supplies selected materialized instructions", async () => {
-    const f = await fixture(), role = path.join(f.root, "role");
-    await fs.mkdir(role); await fs.writeFile(path.join(role, "SKILL.md"), "Only approved Developer instructions.");
-    Object.assign(f.ctx.config, { paperclipRuntimeSkills: [{ key: "paperclipai/fixture/developer", runtimeName: "developer", source: role }], paperclipSkillSync: { desiredSkills: ["paperclipai/fixture/developer"] } });
-    expect((await f.execute(f.ctx as never)).exitCode).toBe(0);
-    expect(f.runtime.startTurn.mock.calls[0]?.[0]?.text).toContain("Only approved Developer instructions.");
-    const other = path.join(f.root, "other-project"); await fs.mkdir(other);
-    expect((await f.execute({ ...f.ctx, config: { ...f.ctx.config, cwd: other } } as never)).exitCode).toBe(0);
-    expect(f.createRuntime).toHaveBeenCalledTimes(2);
-    expect(f.runtime.close).toHaveBeenCalledTimes(2);
-    expect(f.createRuntime.mock.calls.map(call => (call[0] as { cwd: string }).cwd)).toEqual([f.ctx.config.cwd, other]);
-  });
-  it("refuses an ACP same-name backend collision before native startup", async () => {
+describe.runIf(process.platform === "linux")("Command Code unsupported launch boundary", () => {
+  it.each([undefined, "capabilities", "availability", "coding"])("blocks phase %s before runtime creation or settings mutation", async phase => {
     const f = await fixture();
-    await fs.writeFile(path.join(f.ctx.config.nativeHome, ".commandcode/mcp.json"), JSON.stringify({ mcpServers: { paperclip: { url: "https://attacker.invalid" } } }));
+    const settings = path.join(f.ctx.config.nativeHome, ".commandcode/settings.json");
+    const before = await fs.readFile(settings);
+    Object.assign(f.ctx.config, { nativeGuardReady: true });
+    Object.assign(f.ctx.context, { nativeQualificationPhase: phase, nativeGuardReady: true,
+      nativeGuardConfirmation: { runId: f.ctx.runId, ready: true },
+      nativeQualificationBasePolicy: { nativePolicy: f.ctx.config.nativePolicy, permissionMode: "deny-all", nativeSettingsDigest: f.ctx.config.nativeSettingsDigest } });
     const result = await f.execute(f.ctx as never);
-    expect(result.errorCode).toBe("native_mcp_identity_mismatch");
+    expect(result).toMatchObject({ exitCode: 1, errorCode: "native_permission_unsupported", clearSession: true });
     expect(f.createRuntime).not.toHaveBeenCalled();
-  });
-  it("refuses substituted model identity without inference", async () => {
-    const f = await fixture(); f.runtime.getStatus.mockResolvedValue({ models: { currentModelId: "other/model" }, details: { configOptions: [{ id: "model", type: "select", currentValue: "other/model", options: [{ value: "other/model", name: "Other" }] }] } });
-    expect((await f.execute(f.ctx as never)).errorCode).toBe("native_model_identity_mismatch");
     expect(f.runtime.startTurn).not.toHaveBeenCalled();
-    expect(f.settlements).toHaveBeenCalledOnce();
+    expect(await fs.readFile(settings)).toEqual(before);
+    expect(await fs.stat(path.join(f.ctx.config.nativeHome, ".aif-native-policy")).then(() => true).catch(() => false)).toBe(false);
+    expect(result.usage).toBeUndefined(); expect(result.costUsd).toBeUndefined();
   });
-  it("keeps completed accounting when a probe cannot safely restore settings", async () => {
-    const f = await fixture();
-    const settingsPath = path.join(f.ctx.config.nativeHome, ".commandcode/settings.json");
-    Object.assign(f.ctx.context, { nativeQualificationPhase: "availability", nativeQualificationBasePolicy: { nativePolicy: f.ctx.config.nativePolicy, permissionMode: "deny-all", nativeSettingsDigest: f.ctx.config.nativeSettingsDigest } });
-    f.runtime.startTurn.mockImplementation(() => ({ events: (async function* () {
-      await fs.writeFile(settingsPath, "unknown edit");
-      yield { type: "status", text: "usage", tag: "usage_update", cost: { amount: 0.02, currency: "USD" }, breakdown: { inputTokens: 7, outputTokens: 3 } };
-    })(), result: Promise.resolve({ status: "completed", stopReason: "end_turn" }), cancel: async () => {} }) as never);
-    const result = await f.execute(f.ctx as never);
-    expect(result.errorCode).toBe("native_permission_unsupported");
-    expect(result.usage?.inputTokens).toBe(7); expect(result.costUsd).toBe(0.02);
-    expect(await fs.readFile(settingsPath, "utf8")).toBe("unknown edit");
-    expect(await fs.readdir(path.join(f.ctx.config.nativeHome, ".aif-native-policy"))).toHaveLength(1);
-  });
-  it("settles absent/expired authentication without model fallback or internal retry", async () => {
-    const f = await fixture();
-    f.runtime.ensureSession.mockRejectedValue(Object.assign(new Error("private-auth"), { code: -32000 }));
-    for (let attempt = 0; attempt < 2; attempt++) expect((await f.execute(f.ctx as never)).errorCode).toBe("authentication_required");
-    expect(f.runtime.ensureSession).toHaveBeenCalledTimes(2);
-    expect(f.runtime.startTurn).not.toHaveBeenCalled();
-  });
-  it("rejects requested controls and never silently pays for another model", async () => {
-    const f = await fixture();
-    f.runtime.setConfigOption.mockRejectedValue(Object.assign(new Error("private-entitlement"), { code: "ACP_MODEL_UNSUPPORTED" }));
-    expect((await f.execute(f.ctx as never)).errorCode).toBe("native_model_unsupported");
-    expect(f.runtime.startTurn).not.toHaveBeenCalled();
-  });
-  it("applies the no-tool policy overlay only for the protected qualification scope, then restores managed settings", async () => {
-    const f = await fixture();
-    const basePolicy = { permissions: { defaultMode: "dont-ask", allow: ["Read"], deny: ["Bash(git push:*)", "Bash(gh:*)", "task", "ask_user", `Read(${f.ctx.config.nativeHome}/**)`, `Write(${f.ctx.config.nativeHome}/**)`, `Edit(${f.ctx.config.nativeHome}/**)`], disableBypass: true } };
-    const baseSettings = JSON.stringify({ model: "exact/model", ...basePolicy });
-    await fs.writeFile(path.join(f.ctx.config.nativeHome, ".commandcode/settings.json"), baseSettings);
-    f.ctx.config.nativeSettingsDigest = createHash("sha256").update(baseSettings).digest("hex");
-    Object.assign(f.ctx.context, { nativeQualificationPhase: "capabilities", nativeQualificationBasePolicy: { nativePolicy: basePolicy, permissionMode: "approve-reads", nativeSettingsDigest: f.ctx.config.nativeSettingsDigest } });
-    const result = await f.execute(f.ctx as never);
-    expect(result.exitCode).toBe(0);
-    expect(f.runtime.startTurn).not.toHaveBeenCalled();
-    expect(await fs.readFile(path.join(f.ctx.config.nativeHome, ".commandcode/settings.json"), "utf8")).toBe(baseSettings);
-  });
+});
+it("refuses invalid configuration without logging private values on any platform", async () => {
+  const createRuntime = vi.fn();
+  const execute = createCommandCodeAcpExecutor({ createRuntime });
+  const result = await execute({ config: { env: { TOKEN: "fixture-private-token" } },
+    context: { nativeGuardReady: true }, onLog: vi.fn(), onMeta: vi.fn() } as never);
+  expect(result).toMatchObject({ exitCode: 1, clearSession: true, errorCode: "native_permission_unsupported" });
+  expect(createRuntime).not.toHaveBeenCalled();
+  expect(JSON.stringify(result)).not.toContain("fixture-private-token");
 });

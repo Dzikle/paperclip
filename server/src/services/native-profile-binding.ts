@@ -48,7 +48,7 @@ export async function readNativeRuntimePin(adapterType: string): Promise<NativeR
 }
 export interface NativeBindingAgent { id: string; companyId: string; adapterType: string; adapterConfig: Record<string, unknown> }
 export async function resolveNativeBinding(db: Db, agent: NativeBindingAgent, config: Record<string, unknown>, projectId: string, runtimeSkills?: PaperclipSkillEntry[]): Promise<NativeBindingIdentity> {
-  if (["cline_local", "claude_local"].includes(agent.adapterType)) throw new Error("native_permission_unsupported");
+  if (["cline_local", "claude_local", "commandcode_local"].includes(agent.adapterType)) throw new Error("native_permission_unsupported");
   // Persisted agent env is untrusted; controller scratch/Git/network env is added
   // only after this config snapshot. Never fingerprint resolved credential values.
   const ownerEnv = agent.adapterConfig.env;
