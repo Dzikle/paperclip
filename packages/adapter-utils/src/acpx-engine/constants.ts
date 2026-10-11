@@ -32,6 +32,8 @@ export const ACPX_ADAPTER_AGENT_IDS = {
   gemini_local: "gemini",
   kimi_local: "kimi",
   custom_acp: "custom",
+  cline_local: "custom",
+  commandcode_local: "custom",
 } as const;
 
 export type AcpxAdapterType = keyof typeof ACPX_ADAPTER_AGENT_IDS;

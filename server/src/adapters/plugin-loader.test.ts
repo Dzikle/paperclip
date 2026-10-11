@@ -24,6 +24,13 @@ const validLoginCapability: AdapterLoginCapability = {
 };
 
 describe("validateAdapterModule login capability", () => {
+  it("preserves external native ACP capability flags without built-in registration", () => {
+    const native = { type: "cline_local", execute: async () => ({}), testEnvironment: async () => ({}),
+      acp: { agentId: "custom", skillsMode: "unsupported", prerequisites: { nodeRange: ">=24.11.0", packages: [] } },
+      runtimeToolDelivery: "native_mcp", supportsLocalAgentJwt: true, supportsInstructionsBundle: true,
+    };
+    expect(validateAdapterModule({ createServerAdapter: () => native }, "@aif/adapter-cline-local")).toBe(native);
+  });
   it("loads an adapter with no login capability", () => {
     expect(() => validateAdapterModule(makeModule(), "vendor-pkg")).not.toThrow();
   });

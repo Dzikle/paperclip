@@ -1,4 +1,5 @@
 import { cancellableSandboxStartup } from "./startup-cancellation.js";
+import { requireNativeModelIdentity, type NativeModelIdentity } from "../native-provider-contract.js";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import os from "node:os";
@@ -367,6 +368,10 @@ export type AcpxTerminalFailureClassification = Pick<
 >;
 
 export interface AcpxEngineExecutorOptions {
+  /** Fail closed on missing/substituted native model evidence; legacy adapters opt out. */
+  requireModelIdentity?: boolean;
+  /** Supply selected materialized role instructions, not native/global CLI skill staging. */
+  customSkillsMode?: "prompt";
   createRuntime?: AcpxRuntimeFactory;
   now?: () => number;
   /** Inspect terminal provider text in memory; return only recovery labels and a timestamp. */
@@ -1097,6 +1102,38 @@ async function resolveSelectedRuntimeSkills(
     ),
     desiredSkillNames,
   };
+}
+
+async function prepareNativePromptSkills(config: Record<string, unknown>, moduleDir: string, stateDir: string): Promise<{ prompt: string; identity: Record<string, unknown> }> {
+  // Controller-materialized assignments only; never scan global CLI directories.
+  if (!Array.isArray(config.paperclipRuntimeSkills)) throw new Error("native_skill_unavailable");
+  const { selectedSkills, desiredSkillNames } = await resolveSelectedRuntimeSkills(config, moduleDir);
+  if (selectedSkills.length !== desiredSkillNames.length) throw new Error("native_skill_unavailable");
+  const texts: string[] = [];
+  const digests: Array<{ key: string; digest: string }> = [];
+  let bytes = 0;
+  for (const entry of selectedSkills) {
+    const target = path.join(stateDir, "runtime-skills", "native-prompt", shortHash(entry.key));
+    // The shared materializer refuses symlink roots and skips symlink files.
+    await materializePaperclipSkillCopy(entry.source, target);
+    const handle = await fs.open(path.join(target, "SKILL.md"), "r").catch(() => null);
+    if (!handle) throw new Error("native_skill_unavailable");
+    let text: string;
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile()) throw new Error("native_skill_unavailable");
+      if (stat.size + bytes > 32_768) throw new Error("native_skill_limit");
+      const buffer = Buffer.alloc(32_769 - bytes);
+      const read = await handle.read(buffer, 0, buffer.length, 0);
+      text = buffer.subarray(0, read.bytesRead).toString("utf8");
+    } finally { await handle.close(); }
+    const section = `## Paperclip selected skill: ${entry.key}\n${text}`;
+    bytes += Buffer.byteLength(section, "utf8") + (texts.length ? 2 : 0);
+    if (bytes > 32_768) throw new Error("native_skill_limit");
+    texts.push(section);
+    digests.push({ key: entry.key, digest: createHash("sha256").update(text).digest("hex") });
+  }
+  return { prompt: texts.join("\n\n"), identity: { mode: "custom_prompt", desiredSkillNames, loadedSkills: digests } };
 }
 
 async function prepareClaudeSkillRuntime(input: {
@@ -2083,8 +2120,12 @@ async function buildRuntime(input: {
       config,
       await readPaperclipRuntimeSkillEntries(config, input.engine.moduleDir),
     );
-    skillsIdentity = { mode: "custom_unsupported", desiredSkillNames: desired };
-    if (desired.length > 0) {
+    if (input.deps.customSkillsMode === "prompt") {
+      const selected = await prepareNativePromptSkills(config, input.engine.moduleDir, stateDir);
+      skillPromptInstructions = selected.prompt;
+      skillsIdentity = selected.identity;
+    } else skillsIdentity = { mode: "custom_unsupported", desiredSkillNames: desired };
+    if (desired.length > 0 && input.deps.customSkillsMode !== "prompt") {
       skillCommandNotes.push("Selected Paperclip skills are tracked only; ACPX custom commands do not expose a runtime skill contract yet.");
     }
   }
@@ -3193,6 +3234,35 @@ async function readRuntimeStatus(
   }
 }
 
+/** Native controls/status cannot hold startup or settlement open indefinitely. */
+async function boundedNativeOperation<T>(call: (signal: AbortSignal) => Promise<T>, parent?: AbortSignal): Promise<T> {
+  const controller = new AbortController();
+  const abort = () => controller.abort(new Error("native_failed"));
+  if (parent?.aborted) abort();
+  parent?.addEventListener("abort", abort, { once: true });
+  const timer = setTimeout(() => controller.abort(new Error("native_timeout")), ACPX_HANDSHAKE_TIMEOUT_MS);
+  let rejectAbort!: (error: unknown) => void;
+  const cancelled = new Promise<never>((_, reject) => { rejectAbort = reject; });
+  const onAbort = () => rejectAbort(controller.signal.reason);
+  controller.signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    controller.signal.throwIfAborted();
+    return await Promise.race([call(controller.signal), cancelled]);
+  } finally {
+    clearTimeout(timer);
+    parent?.removeEventListener("abort", abort);
+    controller.signal.removeEventListener("abort", onAbort);
+  }
+}
+
+async function readNativeStatus(runtime: AcpRuntime, handle: AcpRuntimeHandle, parent?: AbortSignal): Promise<AcpRuntimeStatus> {
+  if (!runtime.getStatus) throw new Error("native_model_identity_missing");
+  return boundedNativeOperation(async signal => {
+    try { return await runtime.getStatus!({ handle, signal }); }
+    catch { throw new Error("native_transport_failed"); }
+  }, parent);
+}
+
 /**
  * Fold the ACP runtime's post-turn usage into the adapter execution result
  * shape. The runtime persists the latest turn's token breakdown (adapters like
@@ -4075,6 +4145,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       // `endSession` step can cancel a running turn before it closes the runtime
       // (the cancel-before-close order). The turn wrapper assigns it in `turnStart`.
       let activeTurn: AcpRuntimeTurn | null = null;
+      let nativeModelIdentity: NativeModelIdentity | undefined;
       let terminalFailureClassification: AcpxTerminalFailureClassification | null = null;
       // How the settlement `endSession` step must release the runtime for the path
       // this run took. Each exit path that acquired the runtime records it before it
@@ -4590,12 +4661,20 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       }
       const configureSessionStart = now();
       try {
-        await applySessionConfigOptions({
+        const configure = async () => applySessionConfigOptions({
           runtime,
           handle: sessionHandle,
           prepared,
           onLog: ctx.onLog,
         });
+        if (deps.requireModelIdentity) {
+          await boundedNativeOperation(async signal => {
+            await configure();
+            if (!runtime.getStatus) throw new Error("native_model_identity_missing");
+            const status = await runtime.getStatus({ handle: sessionHandle, signal });
+            nativeModelIdentity = requireNativeModelIdentity(status.models?.currentModelId, prepared.requestedModel, "acp_session_status");
+          }, ctx.signal);
+        } else await configure();
         await emitPhase("configure_session", configureSessionStart, "ok");
       } catch (err) {
         // Record a direct close that drops the matching warm entry for the
@@ -4655,6 +4734,18 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       // controller and never rejects; it returns a `TurnCompletion`. The step
       // bodies below record the external result for the coordinator to reproduce.
       const runTurn = async (_ready: StartupReady): Promise<TurnCompletion> => {
+      if (deps.requireModelIdentity && ctx.context.nativeQualificationPhase === "capabilities") {
+        ctx.signal?.throwIfAborted();
+        runtimeSettlement = {
+          mode: "direct", handle: sessionHandle, reason: "paperclip native capability cleanup",
+          discardPersistentState: true, dropWarmEntry: true, recordCloseError: true,
+          cancelTurnReason: null, skipRemoteClose: false,
+        };
+        capturedResult = { exitCode: 0, signal: null, timedOut: false, ...billingFields,
+          resultJson: { phase: "capabilities", nativeModelIdentity }, summary: "Native ACP capabilities inspected; no inference performed." };
+        runFailed = false;
+        return { kind: "finalized" };
+      }
       // Summary accumulation collects output text only (never thought stream),
       // segmented on tool starts so multi-step narration is not glued into one
       // automatic comment dump.
@@ -4741,7 +4832,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       const stepPreTurnUsage = async (): Promise<void> => {
         // Snapshot pre-turn usage so cumulative agent-reported cost can be
         // attributed to this run alone.
-        preTurnStatus = await readRuntimeStatus(runtime, sessionHandle);
+        preTurnStatus = deps.requireModelIdentity
+          ? await readNativeStatus(runtime, sessionHandle, ctx.signal)
+          : await readRuntimeStatus(runtime, sessionHandle);
+        if (deps.requireModelIdentity) nativeModelIdentity = requireNativeModelIdentity(preTurnStatus?.models?.currentModelId, prepared.requestedModel, "acp_session_status");
         // The prepare phase (prompt build + usage snapshot) finished; the turn
         // phase starts next.
         await emitPhase("prepare_turn", preparePhaseStart, "ok");
@@ -4927,16 +5021,28 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // A completed, non-timed-out turn whose channel stayed live is the one
         // success path. Every other outcome — a failed, cancelled, or timed-out
         // terminal, or a completed terminal with a lost channel — is a failure.
-        const turnSucceeded = terminal.status === "completed" && !timedOut && !channelLost;
+        let nativeIdentityFailure: string | null = null;
         // Read usage before the settlement can discard runtime state.
-        const postTurnStatus = await readRuntimeStatus(runtime, sessionHandle);
+        let postTurnStatus: AcpRuntimeStatus | null = null;
+        if (deps.requireModelIdentity) {
+          try {
+            postTurnStatus = await readNativeStatus(runtime, sessionHandle, ctx.signal);
+            nativeModelIdentity = requireNativeModelIdentity(postTurnStatus.models?.currentModelId, prepared.requestedModel, "acp_session_status");
+          } catch (error) {
+            const code = error instanceof Error ? error.message : "";
+            nativeIdentityFailure = ["native_model_identity_missing", "native_model_identity_mismatch", "native_timeout", "native_failed"].includes(code) ? code : "native_transport_failed";
+            nativeModelIdentity = undefined;
+            clearSession = true;
+          }
+        } else postTurnStatus = await readRuntimeStatus(runtime, sessionHandle);
+        const turnSucceeded = terminal.status === "completed" && !timedOut && !channelLost && !nativeIdentityFailure;
         const turnUsage = summarizeAcpxTurnUsage({
           preStatus: preTurnStatus,
           postStatus: postTurnStatus,
           eventBreakdown,
           eventCostUsd,
         });
-        const failedTurn = terminal.status === "failed" || terminal.status === "cancelled" || timedOut;
+        const failedTurn = terminal.status === "failed" || terminal.status === "cancelled" || timedOut || Boolean(nativeIdentityFailure);
         // ACPX can defer session/load until runTurn. Forget an unavailable
         // session so the next bounded turn receives the full task conversation.
         const sessionUnavailable = terminal.status === "failed" &&
@@ -4977,11 +5083,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           skipRemoteClose: channelLost,
         };
 
-        const errorMessage = timedOut
+        const errorMessage = nativeIdentityFailure ?? (timedOut
           ? formatAdapterExecutionTimeoutErrorMessage(prepared.timeoutResolution)
           : channelLost
             ? channelLostMessage
-            : resultErrorMessage(terminal);
+            : resultErrorMessage(terminal));
         const terminalStopReason = terminal.status === "failed" ? terminal.error.message : terminal.stopReason;
         const classifiedFailure = !timedOut && !channelLost && terminal.status === "failed"
           ? terminalFailureClassification
@@ -5001,13 +5107,13 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           signal: timedOut ? "SIGTERM" : null,
           timedOut,
           errorMessage,
-          errorCode: timedOut
+          errorCode: nativeIdentityFailure ?? (timedOut
             ? "acpx_timeout"
             : channelLost
               ? DUPLEX_CHANNEL_LOST_ERROR_CODE
               : terminal.status === "failed"
                 ? classifiedFailure?.errorCode ?? "acpx_turn_failed"
-                : null,
+                : null),
           ...(classifiedFailure?.errorFamily ? { errorFamily: classifiedFailure.errorFamily } : {}),
           ...(classifiedFailure?.retryNotBefore ? { retryNotBefore: classifiedFailure.retryNotBefore } : {}),
           sessionId: sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
@@ -5019,6 +5125,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           ...(turnUsage.usage ? { usage: turnUsage.usage, usageBasis: "per_run" as const } : {}),
           costUsd: turnUsage.costUsd,
           resultJson: {
+            ...(nativeModelIdentity ? { nativeModelIdentity } : {}),
             status: channelLost ? "failed" : terminal.status,
             ...(classifiedFailure?.errorFamily ? { errorFamily: classifiedFailure.errorFamily } : {}),
             ...(classifiedFailure?.retryNotBefore
@@ -5088,6 +5195,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             resources: emptyConsumed,
           };
         }
+        if (nativeIdentityFailure) return { kind: "failed", cause: { kind: "turn_failed", error: new Error(nativeIdentityFailure) }, resources: emptyConsumed };
         if (terminal.status === "failed") {
           return {
             kind: "failed",
