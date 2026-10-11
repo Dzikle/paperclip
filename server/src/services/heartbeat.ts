@@ -17205,6 +17205,7 @@ export function heartbeatService(
   async function claimQueuedRun(
     run: typeof heartbeatRuns.$inferSelect,
     companyAgents?: AgentOrgRow[],
+    deferredQueueEffects?: WakeQueuePostCommitEffect[],
   ) {
     if (run.status !== "queued") return run;
     let agent = await getAgent(run.agentId);
@@ -17220,7 +17221,9 @@ export function heartbeatService(
       if (sourceId && activeRunExecutions.has(sourceId)) return null;
       try { agent = await providerFallbackRuntime(db).resolve(run,agent); }
       catch {
-        await cancelRunInternal(run.id,"Provider fallback qualification or ownership is no longer valid",{suppressImmediateRecovery:true});
+        await cancelRunInternal(run.id,"Provider fallback qualification or ownership is no longer valid",{
+          suppressImmediateRecovery:true, deferredQueueEffects,
+        });
         return null;
       }
     }
@@ -19827,7 +19830,9 @@ export function heartbeatService(
     if ((await getSchedulingSuppression()).suppressed) return [];
     const cutoff = await getWorktreeExecutionCutoff();
 
-    return withAgentStartLock(agentId, async () => {
+    const deferredQueueEffects: WakeQueuePostCommitEffect[] = [];
+    try {
+    return await withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
       if (!agent) return [];
       const invokability = await getAgentInvokability(agent);
@@ -19937,7 +19942,7 @@ export function heartbeatService(
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
       for (const queuedRun of prioritizedRuns) {
         if (claimedRuns.length >= availableSlots) break;
-        const claimed = await claimQueuedRun(queuedRun, companyAgents);
+        const claimed = await claimQueuedRun(queuedRun, companyAgents, deferredQueueEffects);
         if (claimed) claimedRuns.push(claimed);
       }
       if (claimedRuns.length === 0) return [];
@@ -19962,6 +19967,12 @@ export function heartbeatService(
       }
       return claimedRuns;
     });
+    } finally {
+      // Cancellation can promote runs absent from the original queue snapshot.
+      // Dispatch their durable post-commit effects only after releasing this
+      // agent's start lock; never reacquire it from inside the claim loop.
+      await applyWakeQueuePostCommitEffects(deferredQueueEffects);
+    }
   }
 
   // Await every background heartbeat execution that is currently in flight. A
@@ -26257,7 +26268,7 @@ export function heartbeatService(
 
   async function releaseIssueExecutionAndPromote(
     run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">,
-    options: { suppressImmediateRecovery?: boolean } = {},
+    options: { suppressImmediateRecovery?: boolean; deferredQueueEffects?: WakeQueuePostCommitEffect[] } = {},
   ) {
     try {
       const persisted = await getRun(run.id);
@@ -26268,7 +26279,8 @@ export function heartbeatService(
         suppressImmediateRecovery: options.suppressImmediateRecovery || (persisted &&
           (hasProviderFallback(persisted) || persisted.errorCode === "provider_unavailable_bootstrap")) || false,
       });
-      await applyWakeQueuePostCommitEffects(postCommitEffects);
+      if (options.deferredQueueEffects) options.deferredQueueEffects.push(...postCommitEffects);
+      else await applyWakeQueuePostCommitEffects(postCommitEffects);
     } catch (error) {
       if (
         error instanceof WakeQueueApplicationError &&
@@ -27833,6 +27845,14 @@ export function heartbeatService(
             }
           }
 
+          const inheritedFallback = await providerFallbackRuntime(tx as unknown as Db).inheritNativeFollowup(
+            agent, issue.id, {
+              source, triggerDetail, reason, idempotencyKey: opts.idempotencyKey ?? null,
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+            }, enrichedContextSnapshot,
+          );
+          if (inheritedFallback) enrichedContextSnapshot.forceFreshSession = true;
           if (activeExecutionRun) {
             // The resolved action is already a durable retry outbox. Do not merge
             // its fresh-session contract into unrelated work or create a second
@@ -27858,7 +27878,7 @@ export function heartbeatService(
                   contextSnapshot: activeExecutionRun.contextSnapshot,
                   wakeupRequestId: activeExecutionRun.wakeupRequestId,
                 },
-                allowRunCoalescing: isConversation(issue) ? false : opts.allowRunCoalescing,
+                allowRunCoalescing: inheritedFallback || isConversation(issue) ? false : opts.allowRunCoalescing,
                 durableReceipt: durableRequest
                   ? {
                       id: durableRequest.id,
@@ -28181,14 +28201,15 @@ export function heartbeatService(
               wakeupRequestId: wakeupRequest.id,
               retryOfRunId: failedChatRetry
                 ? durableRequest!.failedRunRetry!.failedRunId
-                : opts.failedRunId ?? automaticParentRunId,
+                : opts.failedRunId ?? inheritedFallback?.parentRunId ?? automaticParentRunId,
+              ...(inheritedFallback ? {runnerProfileJson:{providerFallback:inheritedFallback.receipt}} : {}),
               contextSnapshot: adoptedComments.length
                 ? withQueuedCommentIdsInRunContext(
                     enrichedContextSnapshot,
                     adoptedCommentIds,
                   )
                 : enrichedContextSnapshot,
-              sessionIdBefore: explicitContinuation ? null : sessionBefore,
+              sessionIdBefore: explicitContinuation || inheritedFallback ? null : sessionBefore,
               continuationAttempt,
               ...(reconciledSourceRunId
                 ? { retryOfRunId: reconciledSourceRunId }
@@ -28914,6 +28935,8 @@ export function heartbeatService(
     terminationGraceMs?: number;
     /** Caller is immediately scheduling an explicit successor path. */
     suppressImmediateRecovery?: boolean;
+    /** Claim loop will dispatch promoted runs after releasing its start lock. */
+    deferredQueueEffects?: WakeQueuePostCommitEffect[];
   };
 
   function cancellationTerminationGraceMs(
@@ -29211,11 +29234,12 @@ export function heartbeatService(
         });
         await releaseIssueExecutionAndPromote(cancelled, {
           suppressImmediateRecovery: options.suppressImmediateRecovery,
+          deferredQueueEffects: options.deferredQueueEffects,
         });
         await finalizeAgentStatus(run.agentId, "cancelled", undefined, {
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         });
-        await startNextQueuedRunForAgent(run.agentId);
+        if (!options.deferredQueueEffects) await startNextQueuedRunForAgent(run.agentId);
       }
       return cancelled;
     } finally {

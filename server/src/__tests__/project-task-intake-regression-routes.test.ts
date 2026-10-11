@@ -28,6 +28,9 @@ import { errorHandler } from "../middleware/index.js";
 import { runningProcesses } from "../adapters/index.ts";
 import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { providerFallbackRuntime } from "../services/provider-fallback-runtime.js";
+import { createPostgresWakeQueueAdapter, createAdmissionTransactionScope, createWakeAdmissionReader } from "../modules/wake-queue/adapters/postgres.js";
+import { createReleaseIssueExecution } from "../modules/wake-queue/application/use-cases.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -89,9 +92,11 @@ describeEmbeddedPostgres("project task intake and issue update version routes", 
 
   afterEach(async () => {
     issueReadRace.afterRead = null;
-    mockAdapterExecute.mockClear();
     runningProcesses.clear();
     await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
+    mockAdapterExecute.mockReset();
+    mockAdapterExecute.mockImplementation(async () => ({exitCode:0,signal:null,timedOut:false,errorMessage:null,
+      summary:"Project task intake route test run.",provider:"test",model:"test-model"}));
     await db.delete(activityLog);
     await db.delete(issueThreadInteractions);
     await db.delete(issueComments);
@@ -392,6 +397,197 @@ describeEmbeddedPostgres("project task intake and issue update version routes", 
     const [principal] = await db.select().from(agents).where(eq(agents.id,agentId));
     expect(principal.adapterType).toBe("opencode_local");
   },30_000);
+
+  it.each(["handoff", "bounded handoff", "liveness", "competing liveness"])("keeps the sealed fallback through the native %s", async (kind) => {
+    const {agentId,issueId} = await seedProviderLoss();
+    mockAdapterExecute.mockImplementationOnce(async () => providerRejected());
+    const heartbeat = heartbeatService(db);
+    const source = await heartbeat.invoke(agentId,"on_demand",{issueId},"manual");
+    await heartbeat.drainActiveRunExecutions();
+    const [fallback] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId,source!.id));
+    const dispatched: string[] = [];
+    let competingRunId: string | null = null;
+    const completeLeg = async (ctx?: unknown) => {
+      dispatched.push((ctx as {agent:{adapterType:string}}).agent.adapterType);
+      if (kind === "competing liveness" && dispatched.length === 1) {
+        competingRunId = randomUUID();
+        await db.insert(heartbeatRuns).values({id:competingRunId,companyId:fallback.companyId,agentId,status:"scheduled_retry",invocationSource:"automation",
+          contextSnapshot:{issueId,independentInput:true},responsibleUserId:"board-user",scheduledRetryReason:"workspace_busy",
+          scheduledRetryAt:new Date(Date.now()+60_000)});
+        await db.update(issues).set({executionRunId:competingRunId}).where(eq(issues.id,issueId));
+      }
+      // The first success deliberately does not choose an issue disposition:
+      // the real native finalizer must enqueue its corrective handoff.
+      if (dispatched.length === 2 && kind !== "bounded handoff") await db.update(issues).set({status:"done"}).where(eq(issues.id,issueId));
+      return {exitCode:0,signal:null,timedOut:false,errorMessage:null,
+        summary:kind.includes("liveness") && dispatched.length === 1 ? "I'll inspect the task now." : "Recovered",provider:"openai",model:"gpt-5.6-sol"};
+    };
+    mockAdapterExecute.mockImplementationOnce(completeLeg).mockImplementationOnce(completeLeg);
+    const restarted = heartbeatService(db);
+    await restarted.promoteDueScheduledRetries(new Date(Date.now()+5000));
+    await restarted.resumeQueuedRuns();
+    await drainHeartbeatRunsToQuiescence(db,restarted);
+    if (competingRunId) {
+      const [competing] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,competingRunId));
+      expect(competing.contextSnapshot).toEqual({issueId,independentInput:true});
+      const [deferred] = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId,agentId),eq(agentWakeupRequests.status,"deferred_issue_execution")));
+      expect(deferred).toBeTruthy();
+      await db.update(heartbeatRuns).set({status:"succeeded",finishedAt:new Date()}).where(eq(heartbeatRuns.id,competingRunId));
+      const release = createReleaseIssueExecution({issueLock:createPostgresWakeQueueAdapter(db,{
+        resolveResponsibleUserId:async()=>"board-user",getRoutineEnv:async()=>({routineId:null,env:null,responsibleUserId:null}),resolveSessionBeforeForWakeup:async()=>null,
+      }),recovery:{escalateStrandedAssignedIssue:async()=>{throw new Error("Unexpected escalation");},escalateStrandedRecoveryIssueInPlace:async()=>{throw new Error("Unexpected escalation");}}});
+      await release({companyId:fallback.companyId,runId:competingRunId,now:new Date(),suppressImmediateRecovery:true});
+      await restarted.resumeQueuedRuns();
+      await drainHeartbeatRunsToQuiescence(db,restarted);
+    }
+    expect(dispatched).toEqual(["codex_local","codex_local"]);
+    const [wake] = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId,agentId),eq(agentWakeupRequests.reason,kind.includes("liveness") ? "run_liveness_continuation" : "finish_successful_run_handoff")));
+    expect(wake).toBeTruthy();
+    const [handoff] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,wake.runId!));
+    expect(handoff).toMatchObject({status:"succeeded",retryOfRunId:fallback.id,
+      runnerProfileJson:{providerFallback:fallback.runnerProfileJson!.providerFallback,adapterDispatch:{adapterType:"codex_local"}}});
+    const [principal] = await db.select().from(agents).where(eq(agents.id,agentId));
+    expect(principal.adapterType).toBe("opencode_local");
+    expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.agentId,agentId),eq(heartbeatRuns.status,"queued")))).toHaveLength(0);
+  },30_000);
+
+  it.each(["handoff", "liveness"])("preserves the selection through deferred native %s promotion and restart", async (kind) => {
+    const {companyId,agentId,issueId} = await seedProviderLoss();
+    mockAdapterExecute.mockImplementationOnce(async () => providerRejected());
+    const heartbeat = heartbeatService(db);
+    const source = await heartbeat.invoke(agentId,"on_demand",{issueId},"manual");
+    await heartbeat.drainActiveRunExecutions();
+    const [fallback] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId,source!.id));
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.update(issues).set({status:"done"}).where(eq(issues.id,issueId));
+      return {exitCode:0,signal:null,timedOut:false,errorMessage:null,summary:"Recovered",provider:"openai",model:"gpt-5.6-sol"};
+    });
+    await heartbeat.promoteDueScheduledRetries(new Date(Date.now()+5000));
+    await heartbeat.resumeQueuedRuns();
+    await drainHeartbeatRunsToQuiescence(db,heartbeat);
+    const otherAgentId = await seedAgent(companyId), finishingId = randomUUID(), wakeId = randomUUID();
+    await db.insert(heartbeatRuns).values({id:finishingId,companyId,agentId:otherAgentId,status:"succeeded",invocationSource:"automation",
+      contextSnapshot:{issueId},responsibleUserId:"board-user",finishedAt:new Date()});
+    await db.update(issues).set({status:"in_progress",executionRunId:finishingId}).where(eq(issues.id,issueId));
+    const reason = kind === "handoff" ? "finish_successful_run_handoff" : "run_liveness_continuation";
+    const context = {issueId,parentRunId:fallback.id,wakeReason:reason,...(kind === "handoff" ? {sourceRunId:fallback.id} :
+      {livenessContinuationSourceRunId:fallback.id,livenessContinuationState:"plan_only",livenessContinuationAttempt:1})};
+    await db.insert(agentWakeupRequests).values({id:wakeId,companyId,agentId,status:"deferred_issue_execution",source:"automation",triggerDetail:"system",
+      reason,requestedByActorType:"system",requestedByActorId:"heartbeat",payload:{issueId,_paperclipWakeContext:context},
+      idempotencyKey:`${reason}:${issueId}:${fallback.id}:${kind === "handoff" ? "1" : "plan_only:1"}`});
+    // Later ordinary input must not merge into this independently sealed
+    // continuation and replace its source/context while retaining its actor.
+    const mergeTarget = await db.transaction(tx => createWakeAdmissionReader().findExistingDeferredWake(
+      createAdmissionTransactionScope(companyId,tx as unknown as typeof db),{companyId,agentId,issueId},
+    ));
+    expect(mergeTarget).toBeNull();
+    const release = createReleaseIssueExecution({issueLock:createPostgresWakeQueueAdapter(db,{
+      resolveResponsibleUserId:async()=>"board-user",getRoutineEnv:async()=>({routineId:null,env:null,responsibleUserId:null}),
+      resolveSessionBeforeForWakeup:async()=>null,
+    }),recovery:{escalateStrandedAssignedIssue:async()=>{throw new Error("Unexpected escalation");},
+      escalateStrandedRecoveryIssueInPlace:async()=>{throw new Error("Unexpected escalation");}}});
+    await release({companyId,runId:finishingId,now:new Date(),suppressImmediateRecovery:true});
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id,wakeId));
+    const [promoted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,wake.runId!));
+    expect(promoted).toMatchObject({retryOfRunId:fallback.id,runnerProfileJson:{providerFallback:fallback.runnerProfileJson!.providerFallback}});
+    expect(wake.reason).toBe(reason);
+    mockAdapterExecute.mockImplementationOnce(async (ctx) => {
+      expect((ctx as {agent:{adapterType:string}}).agent.adapterType).toBe("codex_local");
+      await db.update(issues).set({status:"done"}).where(eq(issues.id,issueId));
+      return {exitCode:0,signal:null,timedOut:false,errorMessage:null,summary:"Disposition complete",provider:"openai",model:"gpt-5.6-sol"};
+    });
+    const restarted = heartbeatService(db);
+    await restarted.resumeQueuedRuns();
+    await drainHeartbeatRunsToQuiescence(db,restarted);
+    const [completed] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,promoted.id));
+    expect(completed).toMatchObject({status:"succeeded",runnerProfileJson:{providerFallback:fallback.runnerProfileJson!.providerFallback,
+      adapterDispatch:{adapterType:"codex_local"}}});
+  },30_000);
+
+  it.each(["configuration", "approval", "qualification"])("fails closed when the native follow-up selection loses %s", async (invalid) => {
+    const {agentId,issueId,qualificationRunId} = await seedProviderLoss();
+    mockAdapterExecute.mockImplementationOnce(async () => providerRejected());
+    const heartbeat = heartbeatService(db);
+    const source = await heartbeat.invoke(agentId,"on_demand",{issueId},"manual");
+    await heartbeat.drainActiveRunExecutions();
+    const [fallback] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId,source!.id));
+    const dispatched: string[] = [];
+    mockAdapterExecute.mockImplementationOnce(async (ctx) => {
+      dispatched.push((ctx as {agent:{adapterType:string}}).agent.adapterType);
+      if (invalid === "configuration") await db.update(agents).set({adapterConfig:{cwd:"/tmp",model:"changed"}}).where(eq(agents.id,agentId));
+      if (invalid === "approval") await db.update(agentConfigRevisions).set({createdByUserId:null}).where(eq(agentConfigRevisions.agentId,agentId));
+      if (invalid === "qualification") await db.update(heartbeatRuns).set({usageJson:{model:"unproven"}}).where(eq(heartbeatRuns.id,qualificationRunId));
+      return {exitCode:0,signal:null,timedOut:false,errorMessage:null,summary:"Recovered",provider:"openai",model:"gpt-5.6-sol"};
+    });
+    const promotionStartedAt = Date.now();
+    await heartbeat.promoteDueScheduledRetries(new Date(Date.now()+5000));
+    await heartbeat.resumeQueuedRuns();
+    await drainHeartbeatRunsToQuiescence(db,heartbeat);
+    const [child] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId,fallback.id));
+    expect(child).toMatchObject({status:"cancelled",runnerProfileJson:{providerFallback:fallback.runnerProfileJson!.providerFallback}});
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(2);
+    expect(dispatched).toEqual(["codex_local"]);
+    expect(Date.now()-promotionStartedAt).toBeLessThan(10_000);
+  },15_000);
+
+  it("settles a revoked selection and dispatches newly promoted same-agent input after unlocking", async () => {
+    const {companyId,agentId,issueId,qualificationRunId} = await seedProviderLoss();
+    mockAdapterExecute.mockImplementationOnce(async () => providerRejected());
+    const heartbeat = heartbeatService(db);
+    const source = await heartbeat.invoke(agentId,"on_demand",{issueId},"manual");
+    await heartbeat.drainActiveRunExecutions();
+    const [fallback] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId,source!.id));
+    await db.update(heartbeatRuns).set({usageJson:{model:"revoked"}}).where(eq(heartbeatRuns.id,qualificationRunId));
+    await db.update(issues).set({executionRunId:fallback.id}).where(eq(issues.id,issueId));
+    const wakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({id:wakeId,companyId,agentId,status:"deferred_issue_execution",source:"on_demand",triggerDetail:"manual",
+      reason:"issue_commented",requestedByActorType:"user",requestedByActorId:"board-user",payload:{issueId}});
+    mockAdapterExecute.mockImplementationOnce(async (ctx) => {
+      // New independent owner input does not inherit another run's selection.
+      expect((ctx as {agent:{adapterType:string}}).agent.adapterType).toBe("opencode_local");
+      await db.update(issues).set({status:"done"}).where(eq(issues.id,issueId));
+      return {exitCode:0,signal:null,timedOut:false,errorMessage:null,summary:"Owner input handled",provider:"opencode",model:"opencode/free"};
+    });
+    const startedAt = Date.now();
+    await heartbeat.promoteDueScheduledRetries(new Date(Date.now()+5000));
+    await heartbeat.resumeQueuedRuns();
+    await drainHeartbeatRunsToQuiescence(db,heartbeat);
+    const [cancelled] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,fallback.id));
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id,wakeId));
+    expect(cancelled.status).toBe("cancelled");
+    expect(wake).toMatchObject({status:"completed"});
+    expect(wake.runId).toBeTruthy();
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(2);
+    expect(Date.now()-startedAt).toBeLessThan(10_000);
+  },15_000);
+
+  it.each(["parent", "actor", "reason", "idempotency", "sourceContext", "issue", "agent", "configuration", "approval", "qualification"])(
+    "rejects an invalid sealed native follow-up (%s)", async (invalid) => {
+      const {companyId,agentId,issueId,qualificationRunId} = await seedProviderLoss();
+      mockAdapterExecute.mockImplementationOnce(async () => providerRejected());
+      const heartbeat = heartbeatService(db);
+      const source = await heartbeat.invoke(agentId,"on_demand",{issueId},"manual");
+      await heartbeat.drainActiveRunExecutions();
+      const [fallback] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId,source!.id));
+      await db.update(heartbeatRuns).set({status:"succeeded",finishedAt:new Date(),
+        runnerProfileJson:{...fallback.runnerProfileJson,adapterDispatch:{adapterType:"codex_local"}}}).where(eq(heartbeatRuns.id,fallback.id));
+      const runId = randomUUID(), wakeId = randomUUID();
+      await db.insert(agentWakeupRequests).values({id:wakeId,companyId,agentId,source:"automation",triggerDetail:"system",
+        reason: invalid === "reason" ? "issue_commented" : "finish_successful_run_handoff",
+        requestedByActorType:"system",requestedByActorId: invalid === "actor" ? "unrelated-worker" : "heartbeat",
+        idempotencyKey: invalid === "idempotency" ? "forged" : `finish_successful_run_handoff:${issueId}:${fallback.id}:1`,runId});
+      const [child] = await db.insert(heartbeatRuns).values({id:runId,companyId,agentId,status:"queued",invocationSource:"automation",triggerDetail:"system",
+        wakeupRequestId:wakeId,retryOfRunId: invalid === "parent" ? qualificationRunId : fallback.id,
+        runnerProfileJson:fallback.runnerProfileJson,contextSnapshot:{issueId:invalid === "issue" ? randomUUID() : issueId,
+          parentRunId:fallback.id,sourceRunId:invalid === "sourceContext" ? source!.id : fallback.id}}).returning();
+      if (invalid === "agent") await db.update(heartbeatRuns).set({agentId:await seedAgent(companyId)}).where(eq(heartbeatRuns.id,fallback.id));
+      if (invalid === "configuration") await db.update(agents).set({adapterConfig:{cwd:"/tmp",model:"changed"}}).where(eq(agents.id,agentId));
+      if (invalid === "approval") await db.update(agentConfigRevisions).set({createdByUserId:null}).where(eq(agentConfigRevisions.agentId,agentId));
+      if (invalid === "qualification") await db.update(heartbeatRuns).set({usageJson:{model:"unproven"}}).where(eq(heartbeatRuns.id,qualificationRunId));
+      const [principal] = await db.select().from(agents).where(eq(agents.id,agentId));
+      await expect(providerFallbackRuntime(db).resolve(child,principal)).rejects.toThrow(/provider_fallback_/);
+    },30_000);
 
   it.each(["approval", "qualification"])("does not launch an unqualified fallback (%s)",async (invalid) => {
     const {agentId,issueId,qualificationRunId} = await seedProviderLoss();

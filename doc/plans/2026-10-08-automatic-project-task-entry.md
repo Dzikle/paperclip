@@ -57,6 +57,23 @@ Claim and execution revalidate the same receipt. Resource retries preserve the
 selected provider; exhausted switching never silently returns to the primary.
 The existing retry sweep recovers the failure-to-scheduling restart window.
 
+Owner-approved continuation, 2026-10-11: a successful selected-provider run
+that still needs its native disposition or liveness continuation must keep
+the same selection for the same logical agent and issue. The existing native
+queue atomically inherits only the predecessor's sealed receipt, before any
+dispatch. Its persisted system/heartbeat actor, exact native reason and
+idempotency key, parent/source linkage, issue and principal must agree; caller
+payloads cannot supply a selection. Claim/execute revalidate current board
+approval, qualification and configuration. Revocation cancels this continuation
+instead of silently switching back. Native handoff/continuation attempt limits,
+issue ownership, approval, budget, pause and execution barriers still apply;
+no principal settings, reviewer routing, schema or alternate scheduler change.
+Admission protects this continuation from coalescing in either direction.
+Deferred promotion retains its native wake reason and atomically reconstructs
+the receipt from the same persisted source, not caller-supplied profile fields.
+Cancellation queues its release effects until the enclosing agent start lock
+has exited, then dispatches newly promoted work through the same native queue.
+
 Only the effective per-run adapter/config changes. Logical agent ID, permissions,
 budgets, workspace and stages stay put; agent database settings are not rewritten.
 Instructions and run-scoped env remain those of the logical agent. Provider

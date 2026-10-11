@@ -1,5 +1,6 @@
 import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop } from "../../../services/acknowledged-native-stop.js";
 import { instanceSettingsService } from "../../../services/instance-settings.js";
+import { providerFallbackRuntime } from "../../../services/provider-fallback-runtime.js";
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
@@ -424,7 +425,10 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         .update(agentWakeupRequests)
         .set({
           status: "queued",
-          reason: "issue_execution_promoted",
+          reason: sql`case when ${agentWakeupRequests.requestedByActorType} = 'system'
+            and ${agentWakeupRequests.requestedByActorId} = 'heartbeat'
+            and ${agentWakeupRequests.reason} in ('finish_successful_run_handoff', 'run_liveness_continuation')
+            then ${agentWakeupRequests.reason} else 'issue_execution_promoted' end`,
           claimedAt: null,
           finishedAt: null,
           error: null,
@@ -442,6 +446,13 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
     },
 
     async finalizePromotedWake(input) {
+      const [wake] = await tx.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.id,input.wakeId),eq(agentWakeupRequests.companyId,input.companyId),
+        eq(agentWakeupRequests.agentId,input.deferredAgent.id),
+      )).limit(1);
+      const inheritedFallback = wake ? await providerFallbackRuntime(tx).inheritNativeFollowup(
+        input.deferredAgent,input.issue.id,wake,input.contextSnapshot,
+      ) : null;
       const newRun = await tx
         .insert(heartbeatRuns)
         .values({
@@ -453,10 +464,11 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           wakeupRequestId: input.wakeId,
           retryOfRunId: input.authorizedFailedChatRetry
             ? readNonEmptyString(input.contextSnapshot.retryOfRunId)
-            : null,
-          contextSnapshot: input.contextSnapshot,
+            : inheritedFallback?.parentRunId ?? null,
+          ...(inheritedFallback ? {runnerProfileJson:{providerFallback:inheritedFallback.receipt}} : {}),
+          contextSnapshot: inheritedFallback ? {...input.contextSnapshot,forceFreshSession:true} : input.contextSnapshot,
           responsibleUserId: input.responsibleUserId,
-          sessionIdBefore: input.sessionBefore,
+          sessionIdBefore: inheritedFallback ? null : input.sessionBefore,
           continuationAttempt: readContinuationAttempt(input.contextSnapshot.livenessContinuationAttempt),
         })
         .returning()
@@ -874,6 +886,9 @@ export function createWakeAdmissionReader(): WakeAdmissionReader {
             eq(agentWakeupRequests.agentId, agentId),
             eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
             sql`${agentWakeupRequests.payload}->>'issueHandoffSourceRunId' is null`,
+            sql`not coalesce(${agentWakeupRequests.requestedByActorType} = 'system'
+              and ${agentWakeupRequests.requestedByActorId} = 'heartbeat'
+              and ${agentWakeupRequests.reason} in ('finish_successful_run_handoff', 'run_liveness_continuation'), false)`,
             sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
             ...(durableActor
               ? [
@@ -994,13 +1009,19 @@ export function createWakeAdmissionWriter(): WakeAdmissionWriter {
 
     async insertNewDeferredWake(scope, input) {
       const tx = requireAdmissionTx(scope, input.companyId);
+      const context = parseObject(parseObject(input.payload)[DEFERRED_WAKE_CONTEXT_KEY]);
+      const nativeReason = readNonEmptyString(context.wakeReason);
+      const issueId = readNonEmptyString(context.issueId);
+      const inheritedFallback = issueId ? await providerFallbackRuntime(tx).inheritNativeFollowup(
+        {id:input.agentId,companyId:input.companyId},issueId,{...input,reason:nativeReason},context,
+      ) : null;
       await tx.insert(agentWakeupRequests).values({
         ...input.durableReceipt,
         companyId: input.companyId,
         agentId: input.agentId,
         source: input.source,
         triggerDetail: input.triggerDetail,
-        reason: "issue_execution_deferred",
+        reason: inheritedFallback ? nativeReason : "issue_execution_deferred",
         payload: input.payload,
         status: DEFERRED_WAKE_STATUS,
         requestedByActorType: input.requestedByActorType,
