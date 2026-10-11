@@ -27,6 +27,18 @@ describe("Command Code pinned launch and native policy", () => {
   });
 });
 describe.runIf(process.platform === "linux")("Command Code managed filesystem policy", () => {
+  it.each([false, true])("requires corrected protected-home anchors (corrected=%s), without proving a launch", async corrected => {
+    const f = await fixture();
+    const homePattern = corrected ? `/${f.nativeHome}` : f.nativeHome;
+    const permissions = { defaultMode: "dont-ask", allow: ["Read"], disableBypass: true,
+      deny: ["Bash(git push:*)", "Bash(gh:*)", "agent", "ask_user_question", "run_command",
+        `Read(${homePattern}/**)`, `Write(${homePattern}/**)`, `Edit(${homePattern}/**)`] };
+    const text = JSON.stringify({ model: base.model, permissions });
+    await fs.writeFile(path.join(f.nativeHome, ".commandcode/settings.json"), text);
+    const config = { ...f, permissionMode: "approve-reads", nativePolicy: { permissions }, nativeSettingsDigest: createHash("sha256").update(text).digest("hex") };
+    if (corrected) await expect(assertCommandCodePolicy(config)).resolves.toBeUndefined();
+    else await expect(assertCommandCodePolicy(config)).rejects.toThrow("native_permission_unsupported");
+  });
   it("accepts only exact managed no-tool settings without backend MCP", async () => {
     await expect(assertCommandCodePolicy(await fixture())).resolves.toBeUndefined();
   });

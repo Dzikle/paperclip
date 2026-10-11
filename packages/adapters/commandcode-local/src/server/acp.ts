@@ -27,7 +27,8 @@ async function readManagedJson(file: string): Promise<{ value: unknown; digest: 
 }
 /** Refuse unknown settings rather than trusting native backend-over-client MCP precedence.
  * No credentials are read or changed. Actual pinned-CLI enforcement is a separate
- * capability qualification gate; this is not a host isolation boundary. */
+ * capability qualification gate; this is not a host isolation boundary and
+ * passing this inspection never enables the blocked executor. */
 export async function assertCommandCodePolicy(config: Record<string, unknown>): Promise<void> {
   const home = nativeAbsolutePath(config.nativeHome), cwd = nativeAbsolutePath(config.cwd);
   const directory = path.join(home, ".commandcode");
@@ -50,7 +51,11 @@ export async function assertCommandCodePolicy(config: Record<string, unknown>): 
   if (config.permissionMode === "deny-all") {
     if (permissions.allow.length || stable(permissions.deny) !== '["*"]') throw new NativeProviderError("native_permission_unsupported");
   } else {
-    const requiredDenies = ["Bash(git push:*)", "Bash(gh:*)", "task", "ask_user", `Read(${home}/**)`, `Write(${home}/**)`, `Edit(${home}/**)`];
+    // A single leading slash is cwd-relative in 1.79.2. home already begins
+    // with /, so prefix another / for the native filesystem-root anchor.
+    // Control-flow tools bypass native permission rules; listing their real
+    // names is secondary policy documentation, not an enforcement claim.
+    const requiredDenies = ["Bash(git push:*)", "Bash(gh:*)", "agent", "ask_user_question", "run_command", `Read(/${home}/**)`, `Write(/${home}/**)`, `Edit(/${home}/**)`];
     const deny = permissions.deny as string[];
     if (!permissions.allow.length || requiredDenies.some(rule => !deny.includes(rule))) throw new NativeProviderError("native_permission_unsupported");
   }
