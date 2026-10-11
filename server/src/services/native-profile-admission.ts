@@ -80,7 +80,7 @@ export function validateNativeAdmission(input: NativeAdmissionInput): NativeAdmi
       if (run.agentId !== binding.agentId || result?.nativeModelIdentity?.model !== binding.model || !["acp_session_status", "native_response"].includes(String(result?.nativeModelIdentity?.source))
           || result?.baseBindingFingerprint !== admission.bindingFingerprint || result?.mcpDigest !== binding.mcpDigest
           || result?.effectivePolicyDigest !== (index === 0 ? binding.policyDigest : nativeNoToolPolicyDigest(binding.adapterType))) fail("native_qualification_mismatch");
-      if (index === 0 && (run.issueId !== proof.issueId || run.candidateTree !== proof.candidateTree)) fail("native_qualification_mismatch");
+      if (index === 0 && (run.issueId !== proof.issueId || run.candidateTree !== proof.candidateTree || result?.nativeCanaryVerified !== true)) fail("native_qualification_mismatch");
       if (index === 3 && result?.nativeCapabilityVerified !== true) fail("native_qualification_mismatch");
       if (index === 4 && (run.finishedAtMs !== timestamp || input.nowMs - run.finishedAtMs > 900_000)) fail("native_availability_stale");
     }

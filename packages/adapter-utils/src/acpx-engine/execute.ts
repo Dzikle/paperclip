@@ -1,5 +1,5 @@
 import { cancellableSandboxStartup } from "./startup-cancellation.js";
-import { NativeProviderError, requireNativeModelIdentity, type NativeModelIdentity } from "../native-provider-contract.js";
+import { NativeProviderError, requireNativeStatusModel, nativeStructuredFailure, type NativeModelIdentity } from "../native-provider-contract.js";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import os from "node:os";
@@ -3417,6 +3417,8 @@ function classifyError(
     };
   }
   if (nativeOnly) {
+    const structured = nativeStructuredFailure(err);
+    if (structured) return { errorCode: structured, errorMeta: { category: structured } };
     // ACP's structured authentication code, not text containing "login".
     // Traverse only bounded causes emitted by the runtime, never provider prose.
     let cause = err;
@@ -3936,7 +3938,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       ...(billingIdentity?.biller ? { biller: billingIdentity.biller } : {}),
       billingType: billingIdentity?.billingType ?? ("unknown" as const),
     };
-    const warmIdleMs = asNumber(ctx.config.warmHandleIdleMs, DEFAULT_ACP_ENGINE_WARM_HANDLE_IDLE_MS);
+    const warmIdleMs = deps.requireModelIdentity ? 0 : asNumber(ctx.config.warmHandleIdleMs, DEFAULT_ACP_ENGINE_WARM_HANDLE_IDLE_MS);
     // The host run site owns the warm-handle store on this run. It operates over
     // the engine's persistent `warmHandles` map, so a warm runtime stays live for
     // the next compatible resume. The store arms the per-entry idle timer on a
@@ -4296,10 +4298,23 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         flushChildStderr(childStderrState);
         childStderrState.logPath = prepared.childStderrLogPath;
         const persistedRuntimeStore = createRuntimeStore({ stateDir: prepared.stateDir });
+        const invalidatedNativeRecords = new Set<string>();
         const runtimeStore: AcpSessionStore = {
           async load(id) {
             const record = await persistedRuntimeStore.load(id);
             if (!record) return undefined;
+            if (deps.requireModelIdentity && resumeSessionId && !invalidatedNativeRecords.has(id)) {
+              // ACPX retains old options when load/set omit metadata. Remove
+              // historical model authority BEFORE reconnect, once per record;
+              // only this connection's responses can restore proof. Preserve
+              // conversation and accounting, and never replay a failed turn.
+              record.acpx = { ...record.acpx };
+              delete record.acpx.config_options;
+              delete record.acpx.current_model_id;
+              delete record.acpx.available_models;
+              invalidatedNativeRecords.add(id);
+              await persistedRuntimeStore.save(record);
+            }
             // ACPX resumes from the stored session options rather than the
             // options passed to ensureSession. Keep conversation state, but
             // launch the provider with this run's credentials and scratch paths.
@@ -4460,7 +4475,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                       mode: prepared.mode,
                       cwd: prepared.cwd,
                       resumeSessionId,
-                      sessionOptions: { env: prepared.env },
+                      sessionOptions: { env: prepared.env, ...(deps.requireModelIdentity ? { model: prepared.requestedModel } : {}) },
                     }),
                   fence: handshakeFence,
                   isTransportLost: isHandshakeTransportLost,
@@ -4498,7 +4513,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                       agent: prepared.acpxAgent,
                       mode: prepared.mode,
                       cwd: prepared.cwd,
-                      sessionOptions: { env: prepared.env },
+                      sessionOptions: { env: prepared.env, ...(deps.requireModelIdentity ? { model: prepared.requestedModel } : {}) },
                     }),
                   fence: handshakeFence,
                   isTransportLost: isHandshakeTransportLost,
@@ -4690,7 +4705,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             await configure();
             if (!runtime.getStatus) throw new NativeProviderError("native_model_identity_missing");
             const status = await runtime.getStatus({ handle: sessionHandle, signal });
-            nativeModelIdentity = requireNativeModelIdentity(status.models?.currentModelId, prepared.requestedModel, "acp_session_status");
+            nativeModelIdentity = requireNativeStatusModel(status, prepared.requestedModel);
           }, ctx.signal);
         } else await configure();
         await emitPhase("configure_session", configureSessionStart, "ok");
@@ -4854,7 +4869,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         preTurnStatus = deps.requireModelIdentity
           ? await readNativeStatus(runtime, sessionHandle, ctx.signal)
           : await readRuntimeStatus(runtime, sessionHandle);
-        if (deps.requireModelIdentity) nativeModelIdentity = requireNativeModelIdentity(preTurnStatus?.models?.currentModelId, prepared.requestedModel, "acp_session_status");
+        if (deps.requireModelIdentity) nativeModelIdentity = requireNativeStatusModel(preTurnStatus, prepared.requestedModel);
         // The prepare phase (prompt build + usage snapshot) finished; the turn
         // phase starts next.
         await emitPhase("prepare_turn", preparePhaseStart, "ok");
@@ -5046,7 +5061,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         if (deps.requireModelIdentity) {
           try {
             postTurnStatus = await readNativeStatus(runtime, sessionHandle, ctx.signal);
-            nativeModelIdentity = requireNativeModelIdentity(postTurnStatus.models?.currentModelId, prepared.requestedModel, "acp_session_status");
+            nativeModelIdentity = requireNativeStatusModel(postTurnStatus, prepared.requestedModel);
           } catch (error) {
             const code = error instanceof Error ? error.message : "";
             nativeIdentityFailure = ["native_model_identity_missing", "native_model_identity_mismatch", "native_timeout", "native_failed"].includes(code) ? code : "native_transport_failed";
@@ -5108,8 +5123,8 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             ? channelLostMessage
             : resultErrorMessage(terminal));
         const terminalStopReason = terminal.status === "failed" ? terminal.error.message : terminal.stopReason;
-        const classifiedFailure = !timedOut && !channelLost && terminal.status === "failed"
-          ? terminalFailureClassification
+        const classifiedFailure: AcpxTerminalFailureClassification | null = !timedOut && !channelLost && terminal.status === "failed"
+          ? (deps.requireModelIdentity ? { errorCode: nativeStructuredFailure(terminal.error) ?? "native_failed" } : terminalFailureClassification)
           : null;
         await emitAcpxLog(ctx, {
           type: turnSucceeded ? "acpx.result" : "acpx.error",

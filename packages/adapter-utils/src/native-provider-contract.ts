@@ -44,3 +44,25 @@ export function quoteNativeExecutable(executable: string): string {
   if (typeof executable !== "string" || !executable.startsWith("/") || /[\0\r\n]/.test(executable)) throw new Error("native_command_invalid");
   return "'" + executable.replaceAll("'", "'\"'\"'") + "'";
 }
+/** ACPX's model cache can contain a requested-model fallback. configOptions
+ * currentValue is retained from the backend response, not that fallback. */
+export function requireNativeStatusModel(status: { details?: Record<string, unknown> } | null | undefined, expected: string): NativeModelIdentity {
+  const options = status?.details?.configOptions;
+  const candidates = Array.isArray(options) ? options.filter(value => value && typeof value === "object" && value.type === "select" && (value.id === "model" || value.category === "model")) : [];
+  if (candidates.length !== 1) throw new NativeProviderError("native_model_identity_missing");
+  return requireNativeModelIdentity(candidates[0].currentValue, expected, "acp_session_status");
+}
+/** Closed structured protocol codes only; provider prose is never authority. */
+export function nativeStructuredFailure(value: unknown): string | null {
+  let cause = value;
+  for (let depth = 0; depth < 4 && cause && typeof cause === "object"; depth++) {
+    const item = cause as { code?: unknown; detailCode?: unknown; cause?: unknown };
+    const codes = [item.code, item.detailCode];
+    if (codes.some(code => code === -32000 || code === "-32000" || code === "AUTH_REQUIRED" || code === "AUTHENTICATION_REQUIRED")) return "authentication_required";
+    if (codes.some(code => code === "QUOTA_EXCEEDED" || code === "QUOTA_UNAVAILABLE")) return "quota_unavailable";
+    if (codes.some(code => code === "ENTITLEMENT_REQUIRED" || code === "ENTITLEMENT_UNAVAILABLE")) return "entitlement_unavailable";
+    if (codes.includes("ACP_MODEL_UNSUPPORTED")) return "native_model_unsupported";
+    cause = item.cause;
+  }
+  return null;
+}

@@ -8,11 +8,15 @@ export function validAdmissionFixture(): { admission: NativeAdmission; input: Na
   const fingerprint = nativeBindingFingerprint(binding);
   const admission: NativeAdmission = { schemaVersion: 1, binding, bindingFingerprint: fingerprint, qualification: { runId: id(4), issueId: id(5), candidateTree: "d".repeat(40), testsRunId: id(6), reviewerRunId: id(7), capabilityRunId: id(8) }, availability: { runId: id(9), verifiedAt: new Date(nowMs).toISOString(), available: true } };
   const makeRun = (runId: string, phase: NativeRunEvidence["phase"], agentId = binding.agentId): NativeRunEvidence => ({ id: runId, companyId: binding.companyId, agentId, status: "succeeded", projectId: binding.projectId, issueId: phase === "coding" || phase === "tests" || phase === "reviewer" ? id(5) : id(10), phase, finishedAtMs: nowMs,
-    candidateTree: "d".repeat(40), stageApproved: true, resultJson: { nativeModelIdentity: { model: binding.model, source: "acp_session_status" }, baseBindingFingerprint: fingerprint, effectivePolicyDigest: phase === "availability" || phase === "capabilities" ? nativeNoToolPolicyDigest(binding.adapterType) : binding.policyDigest, mcpDigest: binding.mcpDigest, nativeCapabilityVerified: true } });
+    candidateTree: "d".repeat(40), stageApproved: true, resultJson: { nativeModelIdentity: { model: binding.model, source: "acp_session_status" }, baseBindingFingerprint: fingerprint, effectivePolicyDigest: phase === "availability" || phase === "capabilities" ? nativeNoToolPolicyDigest(binding.adapterType) : binding.policyDigest, mcpDigest: binding.mcpDigest, nativeCapabilityVerified: true, nativeCanaryVerified: true } });
   const runs = Object.fromEntries([makeRun(id(4), "coding"), makeRun(id(6), "tests", id(20)), makeRun(id(7), "reviewer", id(21)), makeRun(id(8), "capabilities"), makeRun(id(9), "availability")].map(run => [run.id, run]));
   return { admission, input: { currentBinding: binding, proposed: admission, runs, actor: "owner", nowMs } };
 }
 describe("owner-controlled native profile admission", () => {
+  it("requires controller-confined canary evidence, not just a candidate tree", () => {
+    const f = validAdmissionFixture(); delete f.input.runs[id(4)].resultJson!.nativeCanaryVerified;
+    expect(() => validateNativeAdmission(f.input)).toThrow("native_qualification_mismatch");
+  });
   it("rejects normalized impossible calendar dates in saved metadata", () => {
     const f = validAdmissionFixture();
     f.admission.availability.verifiedAt = "2026-02-30T12:00:00Z";

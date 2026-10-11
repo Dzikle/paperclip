@@ -5208,7 +5208,12 @@ export function agentRoutes(
       const admission = asRecord(existing.metadata)?.nativeProviderAdmission as NativeAdmission ?? null;
       let admitted = false;
       try { assertNativeDispatchAdmission({ currentBinding, admission }); admitted = true; } catch { /* closed unavailable response */ }
-      res.json({ schemaVersion: 1, currentBinding, admission, admitted });
+      let codingSourceReady = false;
+      if (existing.adapterConfig.nativeCanaryBaseCommit) {
+        const { captureNativeCanarySource } = await import("../services/native-canary-source.js");
+        try { await captureNativeCanarySource(currentBinding.cwd, existing.adapterConfig.nativeCanaryBaseCommit); codingSourceReady = true; } catch { /* not a prepared disposable copy */ }
+      }
+      res.json({ schemaVersion: 1, currentBinding, admission, admitted, codingSourceReady });
     } catch { res.json({ schemaVersion: 1, currentBinding: null, admission: null, admitted: false, reason: "native_binding_unverified" }); }
   });
 

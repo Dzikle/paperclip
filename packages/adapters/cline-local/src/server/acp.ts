@@ -1,7 +1,6 @@
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
-import { assertNativeLocalLaunch, buildNativeAcpConfig, executeNativeAcp, nativeText, type NativeAcpExecutorOptions } from "@paperclipai/adapter-utils/native-provider-adapter";
+import { buildNativeAcpConfig, executeNativeAcp, nativeText, type NativeAcpExecutorOptions } from "@paperclipai/adapter-utils/native-provider-adapter";
+import { NativeProviderError } from "@paperclipai/adapter-utils/native-provider-contract";
 export function buildClineAcpConfig(config: Record<string, unknown>, controllerEnv: Record<string, unknown> = {}): Record<string, unknown> {
   const next = buildNativeAcpConfig(config, " --acp", controllerEnv);
   const provider = nativeText(config.provider);
@@ -13,15 +12,11 @@ export function buildClineAcpConfig(config: Record<string, unknown>, controllerE
   return next;
 }
 export function createClineAcpExecutor(options: NativeAcpExecutorOptions = {}) {
-  let execute: ((ctx: AdapterExecutionContext) => Promise<AdapterExecutionResult>) | undefined;
-  return async (ctx: AdapterExecutionContext) => executeNativeAcp(ctx, async protectedCtx => {
-    const config = buildClineAcpConfig(ctx.config, protectedCtx.context.nativeControllerEnv as Record<string, unknown> ?? {});
-    await assertNativeLocalLaunch({ ...protectedCtx, config });
-    if (!execute) {
-      const { createAcpxEngineExecutor } = await import("@paperclipai/adapter-utils/acpx-engine/execute");
-      const moduleDir = path.dirname(fileURLToPath(import.meta.url));
-      execute = createAcpxEngineExecutor({ ...options, adapterType: "cline_local", moduleDir, packageRootDir: path.resolve(moduleDir, "../.."), requireModelIdentity: true, customSkillsMode: "prompt" });
-    }
-    return execute({ ...protectedCtx, config });
+  void options;
+  // HOME alone does not contain native/project MCP, hooks or rules. No owner
+  // grant or probe bypasses this gate. Re-enable only with a reviewed pinned
+  // configuration-authority contract, not a caller-supplied boolean.
+  return async (ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> => executeNativeAcp(ctx, async () => {
+    throw new NativeProviderError("native_permission_unsupported");
   });
 }

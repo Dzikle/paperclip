@@ -48,6 +48,7 @@ export async function readNativeRuntimePin(adapterType: string): Promise<NativeR
 }
 export interface NativeBindingAgent { id: string; companyId: string; adapterType: string; adapterConfig: Record<string, unknown> }
 export async function resolveNativeBinding(db: Db, agent: NativeBindingAgent, config: Record<string, unknown>, projectId: string, runtimeSkills?: PaperclipSkillEntry[]): Promise<NativeBindingIdentity> {
+  if (["cline_local", "claude_local"].includes(agent.adapterType)) throw new Error("native_permission_unsupported");
   // Persisted agent env is untrusted; controller scratch/Git/network env is added
   // only after this config snapshot. Never fingerprint resolved credential values.
   const ownerEnv = agent.adapterConfig.env;
@@ -99,12 +100,25 @@ export async function resolveNativeBinding(db: Db, agent: NativeBindingAgent, co
   let instructions = "";
   if (config.instructionsFilePath) instructions = (await boundedFile(nativeAbsolutePath(config.instructionsFilePath), 32_768)).toString("utf8");
   const effective = await toolAccessService(db).getEffectiveProfilesForAgent(agent.companyId, agent.id);
+  const mcpSecretIds = new Set<string>();
+  function collectSecretRefs(value: unknown): void {
+    if (Array.isArray(value)) { for (const entry of value) collectSecretRefs(entry); return; }
+    if (!value || typeof value !== "object") return;
+    const reference = value as Record<string, unknown>;
+    if (typeof reference.secretId === "string") mcpSecretIds.add(reference.secretId);
+    for (const [key, entry] of Object.entries(reference)) if (key !== "secretId") collectSecretRefs(entry);
+  }
+  for (const connection of effective.installedConnections) collectSecretRefs({ credentialRefs: connection.credentialRefs, credentialSecretRefs: connection.credentialSecretRefs, grants: connection.grants });
+  if (mcpSecretIds.size > 64) throw new Error("native_mcp_identity_mismatch");
+  const mcpCredentialVersions = mcpSecretIds.size ? await db.select({ id: companySecrets.id, version: companySecrets.latestVersion, status: companySecrets.status }).from(companySecrets).where(and(eq(companySecrets.companyId, agent.companyId), inArray(companySecrets.id, [...mcpSecretIds]), isNull(companySecrets.deletedAt))) : [];
+  if (mcpCredentialVersions.length !== mcpSecretIds.size || mcpCredentialVersions.some(secret => secret.status !== "active")) throw new Error("native_mcp_identity_mismatch");
   const mcpDigest = nativeDigest({ profiles: effective.profiles.map(profile => ({ id: profile.id, defaultAction: profile.defaultAction, entries: profile.entries })).sort((a, b) => a.id.localeCompare(b.id)),
+    credentialVersions: mcpCredentialVersions.sort((a, b) => a.id.localeCompare(b.id)),
     tools: [...effective.allowedTools].sort((a, b) => a.id.localeCompare(b.id)),
     connections: effective.installedConnections.map(connection => ({ id: connection.id, name: connection.name, status: connection.status, enabled: connection.enabled, transport: connection.transport, config: connection.config, transportConfig: connection.transportConfig, credentialSecretRefs: connection.credentialSecretRefs, credentialRefs: connection.credentialRefs, grants: connection.grants })).sort((a, b) => a.id.localeCompare(b.id)) });
   const binding: NativeBindingIdentity = { companyId: agent.companyId, agentId: agent.id, projectId, cwd, adapterType: agent.adapterType, model: nativeText(config.model), provider: nativeText(config.provider), accountRef: nativeText(config.accountRef), runtimePin: pin.runtimePin,
     policyDigest: nativeDigest({ permissionMode: config.permissionMode, timeoutSec: config.timeoutSec ?? 600, nativePolicy: config.nativePolicy ?? null, nativeHome: config.nativeHome, nativeSettingsDigest: config.nativeSettingsDigest ?? null, nativeCostTier: config.nativeCostTier, maxPaidUsd: 0, nonInteractivePermissions: "fail", warmHandleIdleMs: 0,
-      envNames: Object.keys(ownerEnv as Record<string, unknown> ?? {}).sort() }),
+      nativeCanaryBaseCommit: config.nativeCanaryBaseCommit ?? null, envNames: Object.keys(ownerEnv as Record<string, unknown> ?? {}).sort() }),
     mcpDigest, instructionsDigest: nativeDigest({ instructions, promptTemplate: config.promptTemplate ?? null, bootstrapPromptTemplate: config.bootstrapPromptTemplate ?? null, skills: selected.sort((a, b) => a.key.localeCompare(b.key)) }), credentialVersionRef };
   nativeBindingFingerprint(binding);
   return binding;

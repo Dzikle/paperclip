@@ -40,7 +40,7 @@ describe("Cline native plugin", () => {
     for (let attempt = 0; attempt < 2; attempt++) {
       const result = await execute(ctx as never);
       expect(result.exitCode).toBe(1);
-      expect(result.errorMessage).toBe("native_failed");
+      expect(result.errorMessage).toBe("native_permission_unsupported");
     }
   });
 });

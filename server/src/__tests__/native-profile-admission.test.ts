@@ -7,10 +7,11 @@ import { resolveNativeBinding } from "../services/native-profile-binding.js";
 import { logActivity } from "../services/activity-log.js";
 vi.mock("../services/native-profile-binding.js", () => ({ resolveNativeBinding: vi.fn() }));
 vi.mock("../services/activity-log.js", () => ({ logActivity: vi.fn(async () => {}) }));
+vi.mock("node:child_process", () => ({ execFile: vi.fn((...args: unknown[]) => (args.at(-1) as Function)(null, { stdout: "d".repeat(40), stderr: "" })) }));
 const id = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
-const binding = { companyId: id(1), agentId: id(2), projectId: id(3), cwd: "/tmp/unused-native-fixture", adapterType: "cline_local", model: "exact/model", provider: "fixture", accountRef: "fixture-account", runtimePin: "fixture@1", policyDigest: "a".repeat(64), mcpDigest: "b".repeat(64), instructionsDigest: "c".repeat(64), credentialVersionRef: "fixture-v1" };
+const binding = { companyId: id(1), agentId: id(2), projectId: id(3), cwd: "/tmp/unused-native-fixture", adapterType: "commandcode_local", model: "exact/model", provider: "fixture", accountRef: "fixture-account", runtimePin: "fixture@1", policyDigest: "a".repeat(64), mcpDigest: "b".repeat(64), instructionsDigest: "c".repeat(64), credentialVersionRef: "fixture-v1" };
 const fingerprint = nativeBindingFingerprint(binding);
-const agent = { id: id(2), companyId: id(1), status: "idle", adapterType: "cline_local", metadata: { unrelated: "preserved", nativeProviderManaged: true }, adapterConfig: { model: binding.model } };
+const agent = { id: id(2), companyId: id(1), status: "idle", adapterType: "commandcode_local", metadata: { unrelated: "preserved", nativeProviderManaged: true }, adapterConfig: { model: binding.model } };
 const admission = { schemaVersion: 1 as const, binding, bindingFingerprint: fingerprint, qualification: { runId: id(4), issueId: id(5), candidateTree: "d".repeat(40), testsRunId: id(6), reviewerRunId: id(7), capabilityRunId: id(8) }, availability: { runId: id(9), verifiedAt: "2026-10-11T12:00:00Z", available: true } };
 beforeEach(() => { vi.clearAllMocks(); vi.mocked(resolveNativeBinding).mockResolvedValue(binding); });
 function fakeDb(current: Record<string, unknown> = agent, rotatedFingerprint = fingerprint, attempts = 0) {
@@ -34,6 +35,23 @@ function fakeDb(current: Record<string, unknown> = agent, rotatedFingerprint = f
   return { db: database as never, writes };
 }
 describe("native admission dispatch/owner integration without external services", () => {
+  it("rejects coding scope with an oversized base timeout before capturing proof", async () => {
+    const scope = { schemaVersion: 1 as const, bindingFingerprint: fingerprint, issueIds: [id(5)], phase: "coding" as const, expiresAt: new Date(Date.now() + 60_000).toISOString(), maxAttempts: 2 as const };
+    const scoped = { ...agent, metadata: { ...agent.metadata, nativeProviderQualification: scope } };
+    await expect(authorizeNativeDispatch(fakeDb(scoped).db, { agent: scoped as never, config: { timeoutSec: 3600 }, issueId: id(5), projectId: id(3), runId: id(30), runtimeSkills: [] })).rejects.toThrow("native_timeout_not_authorized");
+  });
+  it("does not qualify an old HEAD without controller-captured disposable source provenance", async () => {
+    const proof = { binding, baseBindingFingerprint: fingerprint, effectivePolicyDigest: binding.policyDigest, phase: "coding" as const, issueId: id(5), projectId: id(3) };
+    const result = await recordNativeDispatchResult(fakeDb().db, agent as never, id(30), proof, { exitCode: 0, signal: null, timedOut: false, usage: { inputTokens: 7, outputTokens: 3 }, resultJson: { nativeModelIdentity: { model: binding.model, source: "acp_session_status" } } });
+    expect(result.exitCode).toBe(1); expect(result.errorCode).toBe("native_qualification_mismatch");
+    expect(result.resultJson?.nativeProviderProof).not.toHaveProperty("candidateTree");
+    expect(result.usage?.inputTokens).toBe(7);
+  });
+  it("caps coding qualification even when the production timeout is larger", () => {
+    const proof = { binding, baseBindingFingerprint: fingerprint, effectivePolicyDigest: binding.policyDigest, phase: "coding" as const, issueId: id(5), projectId: id(3) };
+    expect(nativeQualificationOverlay({ timeoutSec: 3600 }, proof).timeoutSec).toBe(600);
+    expect(nativeQualificationOverlay({ timeoutSec: 60 }, proof).timeoutSec).toBe(60);
+  });
   it("refuses changed persisted adapter config after runtime config capture", async () => {
     const original = { ...agent, metadata: { ...agent.metadata, nativeProviderAdmission: admission } };
     const current = { ...original, adapterConfig: { ...original.adapterConfig, model: "changed/model" } };
@@ -91,6 +109,6 @@ describe("native admission dispatch/owner integration without external services"
   it("overlays only no-tool policy and bounded availability timeout", () => {
     const proof = { binding, baseBindingFingerprint: fingerprint, effectivePolicyDigest: "e".repeat(64), phase: "availability" as const, issueId: id(5), projectId: id(3) };
     const config = { model: "exact/model", cwd: binding.cwd, provider: "fixture", permissionMode: "approve-reads", timeoutSec: 600, accountRef: "fixture-account" };
-    expect(nativeQualificationOverlay(config, proof)).toEqual({ ...config, permissionMode: "deny-all", timeoutSec: 120 });
+    expect(nativeQualificationOverlay(config, { ...proof, binding: { ...binding, adapterType: "cline_local" } })).toEqual({ ...config, permissionMode: "deny-all", timeoutSec: 120 });
   });
 });

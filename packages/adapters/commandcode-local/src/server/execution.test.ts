@@ -18,7 +18,7 @@ async function fixture() {
   const runtimes: Array<ReturnType<typeof makeRuntime>> = [];
   function makeRuntime() { return {
     ensureSession: vi.fn(async (_input: unknown) => ({ backendSessionId: "backend", agentSessionId: "native", runtimeSessionName: "session" })),
-    setConfigOption: vi.fn(async () => {}), getStatus: vi.fn(async () => ({ models: { currentModelId: "exact/model" } })),
+    setConfigOption: vi.fn(async () => {}), getStatus: vi.fn(async () => ({ models: { currentModelId: "exact/model" }, details: { configOptions: [{ id: "model", type: "select", currentValue: "exact/model", options: [{ value: "exact/model", name: "Exact" }] }] } })),
     startTurn: vi.fn((_input: { text: string }) => ({ events: (async function* () { yield { type: "done", stopReason: "end_turn" }; })(), result: Promise.resolve({ status: "completed", stopReason: "end_turn" }), cancel: async () => {} })), close: vi.fn(async () => {}),
   }; }
   const runtime = makeRuntime();
@@ -51,10 +51,24 @@ describe.runIf(process.platform === "linux")("Command Code injected runtime inte
     expect(f.createRuntime).not.toHaveBeenCalled();
   });
   it("refuses substituted model identity without inference", async () => {
-    const f = await fixture(); f.runtime.getStatus.mockResolvedValue({ models: { currentModelId: "other/model" } });
+    const f = await fixture(); f.runtime.getStatus.mockResolvedValue({ models: { currentModelId: "other/model" }, details: { configOptions: [{ id: "model", type: "select", currentValue: "other/model", options: [{ value: "other/model", name: "Other" }] }] } });
     expect((await f.execute(f.ctx as never)).errorCode).toBe("native_model_identity_mismatch");
     expect(f.runtime.startTurn).not.toHaveBeenCalled();
     expect(f.settlements).toHaveBeenCalledOnce();
+  });
+  it("keeps completed accounting when a probe cannot safely restore settings", async () => {
+    const f = await fixture();
+    const settingsPath = path.join(f.ctx.config.nativeHome, ".commandcode/settings.json");
+    Object.assign(f.ctx.context, { nativeQualificationPhase: "availability", nativeQualificationBasePolicy: { nativePolicy: f.ctx.config.nativePolicy, permissionMode: "deny-all", nativeSettingsDigest: f.ctx.config.nativeSettingsDigest } });
+    f.runtime.startTurn.mockImplementation(() => ({ events: (async function* () {
+      await fs.writeFile(settingsPath, "unknown edit");
+      yield { type: "status", text: "usage", tag: "usage_update", cost: { amount: 0.02, currency: "USD" }, breakdown: { inputTokens: 7, outputTokens: 3 } };
+    })(), result: Promise.resolve({ status: "completed", stopReason: "end_turn" }), cancel: async () => {} }) as never);
+    const result = await f.execute(f.ctx as never);
+    expect(result.errorCode).toBe("native_permission_unsupported");
+    expect(result.usage?.inputTokens).toBe(7); expect(result.costUsd).toBe(0.02);
+    expect(await fs.readFile(settingsPath, "utf8")).toBe("unknown edit");
+    expect(await fs.readdir(path.join(f.ctx.config.nativeHome, ".aif-native-policy"))).toHaveLength(1);
   });
   it("settles absent/expired authentication without model fallback or internal retry", async () => {
     const f = await fixture();

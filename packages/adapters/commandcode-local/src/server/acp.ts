@@ -98,6 +98,7 @@ export function createCommandCodeAcpExecutor(options: NativeAcpExecutorOptions =
       };
       config = { ...config, nativeSettingsDigest: probeDigest };
     }
+    let captured: AdapterExecutionResult | undefined;
     try {
     await assertCommandCodePolicy(config);
     if (!execute) {
@@ -105,7 +106,16 @@ export function createCommandCodeAcpExecutor(options: NativeAcpExecutorOptions =
       const moduleDir = path.dirname(fileURLToPath(import.meta.url));
       execute = createAcpxEngineExecutor({ ...options, adapterType: "commandcode_local", moduleDir, packageRootDir: path.resolve(moduleDir, "../.."), requireModelIdentity: true, customSkillsMode: "prompt" });
     }
-    return await execute({ ...protectedCtx, config });
-    } finally { await restore?.(); }
+    captured = await execute({ ...protectedCtx, config });
+    return captured;
+    } finally {
+      try { await restore?.(); }
+      catch (error) {
+        if (!captured) throw error;
+        // Restoration can fail after billable work. Close the run without
+        // replacing already captured usage, cost or session accounting.
+        return { ...captured, exitCode: 1, errorCode: "native_permission_unsupported", errorMessage: "native_permission_unsupported", clearSession: true };
+      }
+    }
   });
 }
