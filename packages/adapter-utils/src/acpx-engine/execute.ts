@@ -1,5 +1,5 @@
 import { cancellableSandboxStartup } from "./startup-cancellation.js";
-import { requireNativeModelIdentity, type NativeModelIdentity } from "../native-provider-contract.js";
+import { NativeProviderError, requireNativeModelIdentity, type NativeModelIdentity } from "../native-provider-contract.js";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
 import os from "node:os";
@@ -3237,10 +3237,10 @@ async function readRuntimeStatus(
 /** Native controls/status cannot hold startup or settlement open indefinitely. */
 async function boundedNativeOperation<T>(call: (signal: AbortSignal) => Promise<T>, parent?: AbortSignal): Promise<T> {
   const controller = new AbortController();
-  const abort = () => controller.abort(new Error("native_failed"));
+  const abort = () => controller.abort(new NativeProviderError("native_failed"));
   if (parent?.aborted) abort();
   parent?.addEventListener("abort", abort, { once: true });
-  const timer = setTimeout(() => controller.abort(new Error("native_timeout")), ACPX_HANDSHAKE_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(new NativeProviderError("native_timeout")), ACPX_HANDSHAKE_TIMEOUT_MS);
   let rejectAbort!: (error: unknown) => void;
   const cancelled = new Promise<never>((_, reject) => { rejectAbort = reject; });
   const onAbort = () => rejectAbort(controller.signal.reason);
@@ -3256,10 +3256,10 @@ async function boundedNativeOperation<T>(call: (signal: AbortSignal) => Promise<
 }
 
 async function readNativeStatus(runtime: AcpRuntime, handle: AcpRuntimeHandle, parent?: AbortSignal): Promise<AcpRuntimeStatus> {
-  if (!runtime.getStatus) throw new Error("native_model_identity_missing");
+  if (!runtime.getStatus) throw new NativeProviderError("native_model_identity_missing");
   return boundedNativeOperation(async signal => {
     try { return await runtime.getStatus!({ handle, signal }); }
-    catch { throw new Error("native_transport_failed"); }
+    catch { throw new NativeProviderError("native_transport_failed"); }
   }, parent);
 }
 
@@ -3385,8 +3385,10 @@ function describeErrorDiagnostics(err: unknown): {
 function classifyError(
   err: unknown,
   phase?: AcpxExecutionPhase,
+  nativeOnly = false,
 ): Pick<AdapterExecutionResult, "errorCode" | "errorMeta"> {
   const message = err instanceof Error ? err.message : String(err);
+  if (err instanceof NativeProviderError) return { errorCode: err.code, errorMeta: { category: err.code } };
   const diagnostics = describeErrorDiagnostics(err);
   const { acpCode, errorName, causeMessage, retryable, stackPreview } = diagnostics;
   const baseMeta: Record<string, unknown> = {
@@ -3413,6 +3415,19 @@ function classifyError(
       errorCode: "acpx_handshake_transport_lost",
       errorMeta: { category: "runtime", ...baseMeta },
     };
+  }
+  if (nativeOnly) {
+    // ACP's structured authentication code, not text containing "login".
+    // Traverse only bounded causes emitted by the runtime, never provider prose.
+    let cause = err;
+    for (let depth = 0; depth < 4 && cause && typeof cause === "object"; depth++) {
+      const code = (cause as { code?: unknown }).code;
+      if (code === -32000) return { errorCode: "authentication_required", errorMeta: { category: "authentication_required" } };
+      if (code === "ACP_MODEL_UNSUPPORTED") return { errorCode: "native_model_unsupported", errorMeta: { category: "native_model_unsupported" } };
+      cause = (cause as { cause?: unknown }).cause;
+    }
+    const category = acpCode === "ACP_BACKEND_UNSUPPORTED_CONTROL" ? "native_permission_unsupported" : "native_failed";
+    return { errorCode: category, errorMeta: { category } };
   }
   const lower = message.toLowerCase();
   const authLike = lower.includes("auth") || lower.includes("login") || lower.includes("credential");
@@ -3478,6 +3493,7 @@ async function emitAcpxFailure(input: {
   prepared: AcpxPreparedRuntime;
   err: unknown;
   phase: AcpxExecutionPhase;
+  nativeOnly?: boolean;
   // Replace the err-derived message in both the stderr-tail log header and the
   // acpx.error payload. Used by the turn path to surface the self-describing
   // adapter execution timeout message instead of the raw underlying error.
@@ -3497,7 +3513,7 @@ async function emitAcpxFailure(input: {
   const { ctx, prepared, err, phase, messageOverride, suppressChildStderrTail } = input;
   const rawMessage = err instanceof Error ? err.message : String(err);
   const message = messageOverride ?? rawMessage;
-  const classified = classifyError(err, phase);
+  const classified = classifyError(err, phase, input.nativeOnly);
   const childStderrTail = suppressChildStderrTail
     ? null
     : await readChildStderrTail({ logPath: prepared.childStderrLogPath });
@@ -4558,6 +4574,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             prepared,
             err,
             phase: "ensure_session",
+            nativeOnly: deps.requireModelIdentity,
             // The guard's own message is already generic and host-authored, so
             // this replaces the underlying error text with the same closed
             // message `classifyError` classified — the ensure_session phase
@@ -4638,6 +4655,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           prepared,
           err,
           phase: "create_runtime",
+          nativeOnly: deps.requireModelIdentity,
         });
         capturedResult = {
           exitCode: 1,
@@ -4670,7 +4688,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         if (deps.requireModelIdentity) {
           await boundedNativeOperation(async signal => {
             await configure();
-            if (!runtime.getStatus) throw new Error("native_model_identity_missing");
+            if (!runtime.getStatus) throw new NativeProviderError("native_model_identity_missing");
             const status = await runtime.getStatus({ handle: sessionHandle, signal });
             nativeModelIdentity = requireNativeModelIdentity(status.models?.currentModelId, prepared.requestedModel, "acp_session_status");
           }, ctx.signal);
@@ -4697,6 +4715,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           prepared,
           err,
           phase: "configure_session",
+          nativeOnly: deps.requireModelIdentity,
         });
         capturedResult = {
           exitCode: 1,
@@ -5245,7 +5264,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // run records a degraded result from the pre-emit message.
         let emitted: Awaited<ReturnType<typeof emitAcpxFailure>> | null = null;
         try {
-          emitted = await emitAcpxFailure({ ctx, prepared, err, phase, messageOverride });
+          emitted = await emitAcpxFailure({ ctx, prepared, err, phase, messageOverride, nativeOnly: deps.requireModelIdentity });
         } catch {
           emitted = null;
         }

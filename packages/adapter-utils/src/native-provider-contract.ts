@@ -11,6 +11,10 @@ export interface NativeBindingIdentity {
 export interface NativeModelIdentity {
   model: string; source: "acp_session_status" | "native_response";
 }
+/** A controller-generated closed code, distinguishable from arbitrary native text. */
+export class NativeProviderError extends Error {
+  constructor(readonly code: string) { super(code); this.name = "NativeProviderError"; }
+}
 const identityKeys: Array<keyof NativeBindingIdentity> = [
   "companyId", "agentId", "projectId", "cwd", "adapterType", "model", "provider",
   "accountRef", "runtimePin", "policyDigest", "mcpDigest", "instructionsDigest", "credentialVersionRef",
@@ -32,8 +36,8 @@ export function nativeBindingFingerprint(binding: NativeBindingIdentity): string
   return createHash("sha256").update(JSON.stringify(canonical), "utf8").digest("hex");
 }
 export function requireNativeModelIdentity(actual: unknown, expected: string, source: NativeModelIdentity["source"]): NativeModelIdentity {
-  if (typeof actual !== "string" || !actual.trim()) throw new Error("native_model_identity_missing");
-  if (!expected.trim() || actual !== expected) throw new Error("native_model_identity_mismatch");
+  if (typeof actual !== "string" || !actual.trim()) throw new NativeProviderError("native_model_identity_missing");
+  if (!expected.trim() || actual !== expected) throw new NativeProviderError("native_model_identity_mismatch");
   return { model: actual, source };
 }
 export function quoteNativeExecutable(executable: string): string {

@@ -1,0 +1,11 @@
+{
+  "name": "@aif/adapter-cline-local", "version": "0.1.0", "private": true,
+  "type": "module", "main": "./dist/index.js", "types": "./dist/index.d.ts",
+  "exports": { ".": "./src/index.ts", "./ui-parser": "./src/ui-parser.ts" },
+  "publishConfig": { "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" }, "./ui-parser": "./dist/ui-parser.cjs" } },
+  "paperclip": { "adapterUiParser": "1.0.0" }, "files": ["dist"],
+  "scripts": { "build": "tsc && esbuild src/ui-parser.ts --bundle --platform=browser --format=cjs --outfile=dist/ui-parser.cjs", "typecheck": "tsc --noEmit" },
+  "dependencies": { "@paperclipai/adapter-utils": "workspace:*" },
+  "devDependencies": { "@types/node": "^24.0.0", "typescript": "^7.0.2", "esbuild": "0.28.2" },
+  "engines": { "node": ">=24.11.0" }
+}
