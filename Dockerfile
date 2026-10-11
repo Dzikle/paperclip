@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.20
-FROM node:24-trixie-slim AS base
+FROM node:24.21.0-trixie-slim AS base
 ARG USER_UID=1000
 ARG USER_GID=1000
 RUN apt-get update \
@@ -144,6 +144,9 @@ RUN pnpm --filter @paperclipai/plugin-sdk build
 # end of its stage. Empty for local `docker build`, which then writes no stamp.
 ENV NODE_OPTIONS=--max-old-space-size=4096
 RUN pnpm --filter @paperclipai/server build
+RUN pnpm --filter @paperclipai/adapter-utils build \
+  && pnpm --filter @aif/adapter-cline-local build \
+  && pnpm --filter @aif/adapter-commandcode-local build
 RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" && exit 1)
 RUN rm -rf packages/paperclip-runner/runner/target
 
@@ -159,8 +162,10 @@ WORKDIR /app
 # the app copy changes on every commit — ordered the other way around, this
 # (the single most expensive layer: four CLI toolchains + apt, per arch) can
 # never hit the layer cache and rebuilds on every build.
+COPY scripts/install-pinned-native-runtimes.mjs /opt/aif/install-pinned-native-runtimes.mjs
 RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
-  && npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest @moonshot-ai/kimi-code@latest \
+  && npm install --global --omit=dev @anthropic-ai/claude-code@2.1.293 @openai/codex@0.161.0 opencode-ai@1.18.35 @google/gemini-cli@latest @moonshot-ai/kimi-code@latest \
+  && node /opt/aif/install-pinned-native-runtimes.mjs \
   && apt-get update \
   && apt-get install -y --no-install-recommends openssh-client jq \
   && rm -rf /var/lib/apt/lists/* \
@@ -171,6 +176,8 @@ COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 COPY --chown=node:node --from=build /app /app
+RUN node scripts/materialize-native-provider-packages.mjs \
+  && node scripts/generate-native-runtime-pins.mjs
 
 # Declare per-build metadata after the stable RUN layers. Docker includes
 # in-scope ARG values in a RUN's environment even when its command does not
