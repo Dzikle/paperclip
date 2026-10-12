@@ -428,18 +428,37 @@ describe("issue validators", () => {
     expect(parsed.description).toBe("Line 1\n\nLine 2");
   });
 
-  it("normalizes escaped line breaks in thread summaries and documents", () => {
+  it("normalizes escaped line breaks in thread summaries", () => {
     const response = respondIssueThreadInteractionSchema.parse({
       answers: [],
       summaryMarkdown: "Summary\\n\\nNext action",
     });
-    const document = upsertIssueDocumentSchema.parse({
-      format: "markdown",
-      body: "# Plan\\n\\nShip it",
-    });
-
     expect(response.summaryMarkdown).toBe("Summary\n\nNext action");
-    expect(document.body).toBe("# Plan\n\nShip it");
+  });
+
+  it("preserves multiline JSON plan strings and literal backslash paths in documents", () => {
+    const plan = {
+      kind: "analysis",
+      answer: "First fact\n\nSecond fact",
+      path: "C:\\new\\repo",
+      literal: "\\r\\n",
+    };
+    const body = JSON.stringify(plan);
+    const document = upsertIssueDocumentSchema.parse({ format: "markdown", body });
+
+    expect(document.body).toBe(body);
+    expect(JSON.parse(document.body)).toEqual(plan);
+  });
+
+  it("preserves Markdown code escapes and actual CRLF text in documents", () => {
+    const body = "# Plan\r\n\r\n```js\r\nconst newline = '\\n';\r\n```\r\n";
+    expect(upsertIssueDocumentSchema.parse({ format: "markdown", body }).body).toBe(body);
+  });
+
+  it("retains document body type and size limits without rewriting text", () => {
+    expect(upsertIssueDocumentSchema.safeParse({ format: "markdown", body: 123 }).success).toBe(false);
+    expect(upsertIssueDocumentSchema.safeParse({ format: "markdown", body: "x".repeat(524289) }).success).toBe(false);
+    expect(upsertIssueDocumentSchema.parse({ format: "markdown", body: "x".repeat(524288) }).body.length).toBe(524288);
   });
 
   it("clamps oversized requestDepth values on create", () => {
