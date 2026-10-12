@@ -322,7 +322,7 @@ jobs:
         run: node --test '.github/scripts/tests/*.test.mjs'
 
       - name: Test portable verification entry points and shard partition
-        run: node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs ./scripts/__tests__/portable-vitest-launch.test.mjs ./scripts/__tests__/portable-build-assets.test.mjs ./scripts/__tests__/portable-temp-root.test.mjs
+        run: node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs ./scripts/__tests__/portable-vitest-launch.test.mjs ./scripts/__tests__/portable-build-assets.test.mjs ./scripts/__tests__/portable-temp-root.test.mjs ./scripts/__tests__/prp-checkout-bytes.test.mjs
 
       - name: Test e2e shard partition
         run: node --test ./scripts/__tests__/e2e-shard.test.mjs

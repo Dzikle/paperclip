@@ -10483,7 +10483,7 @@ describe("runnerd provider runtime wiring", () => {
       acpxExecution,
       expect.objectContaining({
         acpxRuntimeDirectory: expect.stringContaining(
-          "/runtime/paperclip-runner/acpx",
+          join("/", "runtime", "paperclip-runner", "acpx"),
         ),
         acpxDynamicToolHandler: expect.any(Function),
       }),

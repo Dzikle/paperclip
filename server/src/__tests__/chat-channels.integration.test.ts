@@ -189,6 +189,7 @@ import { PaperclipControlPlanePort } from "../services/native-runtime/paperclip-
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
+  EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
 } from "./helpers/embedded-postgres.js";
 
 const externalTestDatabaseUrl = process.env.PAPERCLIP_TEST_DATABASE_URL;
@@ -1024,7 +1025,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       );
       db = createDb(tempDb.connectionString);
     }
-  }, 30_000);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   afterAll(async () => {
     await tempDb?.cleanup();

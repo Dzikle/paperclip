@@ -1,1 +1,9 @@
 patches/*.patch whitespace=-space-before-tab
+
+# PRP checks compare generated text and hash source bytes. Keep checkout bytes
+# identical to the canonical Git blobs; do not weaken checks for CRLF drift.
+packages/paperclip-runner/protocol/*.json text eol=lf
+packages/paperclip-runner/protocol/**/*.json text eol=lf
+packages/paperclip-runner/src/protocol/generated/*.ts text eol=lf
+packages/paperclip-runner/src/drivers/acpx/generated-sidecar-contract.ts text eol=lf
+packages/paperclip-runner/runner/crates/runner-core/src/generated_acpx_sidecar_contract.rs text eol=lf
