@@ -4,12 +4,22 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSy
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import { loadShardDurations, selectGeneralServerShard } from "./general-server-shard.mjs";
 
 import { assertSelectedTests, partitionTestLines } from "./test-line-shard.mjs";
 
 const repoRoot = process.cwd();
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
+function spawnVitest(args, options) {
+  // A Windows pnpm .cmd shim cannot be spawned without a shell. Use the
+  // installed package's JS bin with the current Node executable instead;
+  // argument arrays and child failure codes retain their existing semantics.
+  const manifest = require.resolve("vitest/package.json");
+  const bin = JSON.parse(readFileSync(manifest, "utf8")).bin.vitest;
+  return spawnSync(process.execPath, [path.resolve(path.dirname(manifest), bin), ...args], options);
+}
 const generalServerShardDurations = loadShardDurations(
   path.join(scriptsDir, "general-server-shard-durations.json"),
 );
@@ -326,7 +336,7 @@ function runVitest(args, label, testShard = null) {
   if (testShard) {
     const collect = (filters, name) => {
       const output = path.join(testRoot, `${name}.json`);
-      const result = spawnSync("pnpm", ["exec", "vitest", "list", ...sourceOnlyVitestArgs,
+      const result = spawnVitest(["list", ...sourceOnlyVitestArgs,
         ...filters, "--allowOnly=false", "--includeTaskLocation", `--json=${output}`], {
         cwd: repoRoot, env, stdio: "inherit",
       });
@@ -342,7 +352,7 @@ function runVitest(args, label, testShard = null) {
     console.log(`[test:run] chat shard ${testShard.index + 1}/${testShard.count}: ${selected.tests.length}/${collected.length} tests, ${selected.lines.length} source lines; exact filter coverage verified`);
     args.push("--allowOnly=false");
   }
-  const result = spawnSync("pnpm", ["exec", "vitest", "run", ...sourceOnlyVitestArgs, ...args], {
+  const result = spawnVitest(["run", ...sourceOnlyVitestArgs, ...args], {
     cwd: repoRoot,
     env,
     stdio: "inherit",

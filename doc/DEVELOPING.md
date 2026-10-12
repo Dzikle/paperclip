@@ -2,6 +2,25 @@
 
 This project can run fully in local dev without setting up PostgreSQL manually.
 
+## Portable verification entry points
+
+The stable test runner invokes the installed Vitest JavaScript bin through the
+current Node executable, without spawning a `pnpm` shell shim. Existing project,
+shard, collection and exit-code semantics are retained. Shared notice files and
+DB migration assets are copied by package-local Node post-build scripts; DB
+source checks still run before compilation. No database migration is applied.
+
+Run entry-point and shard regressions with:
+
+```sh
+node --test scripts/__tests__/portable-vitest-launch.test.mjs scripts/__tests__/portable-build-assets.test.mjs scripts/__tests__/portable-temp-root.test.mjs scripts/__tests__/run-vitest-stable-shard.test.mjs
+```
+
+These portable entry points do not establish that every test fixture, generated
+contract or native dependency supports Windows. Report failures from `pnpm -r
+typecheck`, `pnpm test:run` and `pnpm build` separately; do not drop failing suites
+or regenerate unrelated contracts merely to make a portability check pass.
+
 ## Deployment Modes
 
 For mode definitions and intended CLI behavior, see `doc/DEPLOYMENT-MODES.md`.
