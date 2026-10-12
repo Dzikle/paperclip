@@ -1,5 +1,8 @@
 # Portable verification entry points — 2026-10-12
 
+Later bounded follow-up: [PRP checkout and test setup repair](2026-10-12-prp-repair-batch.md)
+supersedes the stale-PRP gate status below, not this report's historical test evidence.
+
 ## Outcome and scope
 
 The owner-approved bounded fix is implemented locally. Windows no longer needs
